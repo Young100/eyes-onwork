@@ -1,0 +1,8 @@
+{
+  "name": "eyes-onwork",
+  "description": "Plateforme tout-en-un de gestion de projets, clients et processus créatifs pour graphistes freelances.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

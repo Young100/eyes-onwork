@@ -1,0 +1,274 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isSuperAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.email == 'ouattaraabdoulaye479@gmail.com' ||
+        request.auth.token.role == 'superadmin' ||
+        request.auth.token.isSuperAdmin == true
+      );
+    }
+
+    function isInWorkspace(workspaceId) {
+      return isAuthenticated() && (
+        request.auth.token.workspaceId == workspaceId ||
+        isSuperAdmin()
+      );
+    }
+
+    function isAccountFullyOnboarded() {
+      return isAuthenticated() && (
+        isSuperAdmin() || (
+          (request.auth.token.email_verified == true || request.auth.token.firebase.sign_in_provider == 'google.com') &&
+          request.auth.token.termsAcceptedVersion != null &&
+          request.auth.token.onboardingCompleted == true
+        )
+      );
+    }
+
+    function isResourceWorkspaceMember() {
+      return isAuthenticated() && (
+        isInWorkspace(resource.data.workspaceId) ||
+        request.auth.uid == resource.data.ownerId ||
+        isSuperAdmin()
+      ) && isAccountFullyOnboarded();
+    }
+
+    function willBeResourceWorkspaceMember() {
+      return isAuthenticated() && (
+        isInWorkspace(request.resource.data.workspaceId) ||
+        request.auth.uid == request.resource.data.ownerId ||
+        isSuperAdmin()
+      ) && isAccountFullyOnboarded();
+    }
+
+    // 1. Profil Utilisateur (/users/{userId}) & Index Email
+    match /users/{userId} {
+      allow read, write: if true;
+    }
+
+    match /users_by_email/{emailKey} {
+      allow read, write: if true;
+    }
+
+    // 2. Espaces de travail multi-comptes (/workspaces/{workspaceId})
+    match /workspaces/{workspaceId} {
+      // Les membres du workspace et le super admin peuvent lire
+      allow read: if isInWorkspace(workspaceId);
+      
+      // Seul un utilisateur connecté peut créer son premier workspace
+      allow create: if isAuthenticated() && request.auth.uid == request.resource.data.ownerId;
+      
+      // Modification du nom / paramètres du workspace
+      // Règle critique : un utilisateur NE PEUT PAS modifier son planId ou son statut d'abonnement directement côté client
+      allow update: if isInWorkspace(workspaceId) && (
+        isSuperAdmin() ||
+        (
+          request.resource.data.planId == resource.data.planId &&
+          request.resource.data.planStatus == resource.data.planStatus &&
+          request.resource.data.ownerId == resource.data.ownerId
+        )
+      );
+
+      allow delete: if isSuperAdmin();
+    }
+
+    // 3. Répertoire Clients (/clients/{clientId})
+    // Hermétiquement scellé par workspaceId
+    match /clients/{clientId} {
+      allow read: if isResourceWorkspaceMember();
+      allow create: if willBeResourceWorkspaceMember();
+      allow update, delete: if isResourceWorkspaceMember();
+    }
+
+    // 4. Projets créatifs (/projects/{projectId})
+    match /projects/{projectId} {
+      // Les membres du workspace ont un accès complet
+      // Intégrité : chaque projet doit avoir un clientId obligatoire rattaché au même espace
+      allow read: if isResourceWorkspaceMember();
+      allow create: if willBeResourceWorkspaceMember() &&
+                       request.resource.data.clientId is string &&
+                       request.resource.data.clientId.size() > 0 &&
+                       (!exists(/databases/$(database)/documents/clients/$(request.resource.data.clientId)) ||
+                        get(/databases/$(database)/documents/clients/$(request.resource.data.clientId)).data.workspaceId == request.resource.data.workspaceId);
+      allow update: if isResourceWorkspaceMember() &&
+                       request.resource.data.clientId is string &&
+                       request.resource.data.clientId.size() > 0 &&
+                       (!exists(/databases/$(database)/documents/clients/$(request.resource.data.clientId)) ||
+                        get(/databases/$(database)/documents/clients/$(request.resource.data.clientId)).data.workspaceId == request.resource.data.workspaceId);
+      allow delete: if isResourceWorkspaceMember();
+
+      // Accès sécurisé par lien client unique (jeton clientShareToken)
+      // Le client ne peut lire que son propre projet, sans jamais voir les notes privées ni le reste du workspace
+      allow get: if resource.data.clientLinkActive == true &&
+                    request.query.token == resource.data.clientShareToken;
+
+      // Le client peut uniquement soumettre un retour de maquette ou accepter un brief
+      allow update: if resource.data.clientLinkActive == true &&
+                       request.query.token == resource.data.clientShareToken &&
+                       // Les champs financiers et d'appartenance ne peuvent pas être modifiés par le client
+                       request.resource.data.budget == resource.data.budget &&
+                       request.resource.data.workspaceId == resource.data.workspaceId &&
+                       request.resource.data.ownerId == resource.data.ownerId &&
+                       request.resource.data.clientId == resource.data.clientId &&
+                       request.resource.data.clientShareToken == resource.data.clientShareToken;
+
+      // Sous-collection des maquettes et retours
+      match /mockups/{mockupId} {
+        allow read: if isOwner(get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId) ||
+                       isInWorkspace(get(/databases/$(database)/documents/projects/$(projectId)).data.workspaceId) ||
+                       (get(/databases/$(database)/documents/projects/$(projectId)).data.clientLinkActive == true &&
+                        request.query.token == get(/databases/$(database)/documents/projects/$(projectId)).data.clientShareToken);
+        allow write: if isOwner(get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId) ||
+                        isInWorkspace(get(/databases/$(database)/documents/projects/$(projectId)).data.workspaceId);
+      }
+
+      // Sous-collection des livrables finaux : VERROUILLÉS tant que le solde n'est pas réglé
+      match /deliverables/{deliverableId} {
+        allow read: if isOwner(get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId) ||
+                       isInWorkspace(get(/databases/$(database)/documents/projects/$(projectId)).data.workspaceId) ||
+                       (get(/databases/$(database)/documents/projects/$(projectId)).data.clientLinkActive == true &&
+                        request.query.token == get(/databases/$(database)/documents/projects/$(projectId)).data.clientShareToken &&
+                        // Règle de sécurité stricte anti-impayés
+                        (get(/databases/$(database)/documents/projects/$(projectId)).data.delivery.mode == 'manual' &&
+                         get(/databases/$(database)/documents/projects/$(projectId)).data.currentStep == 'livraison') ||
+                        (get(/databases/$(database)/documents/projects/$(projectId)).data.paidAmount >= get(/databases/$(database)/documents/projects/$(projectId)).data.budget));
+        allow write: if isOwner(get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId) ||
+                        isInWorkspace(get(/databases/$(database)/documents/projects/$(projectId)).data.workspaceId);
+      }
+    }
+
+    // 5. Devis (/quotes/{quoteId})
+    match /quotes/{quoteId} {
+      allow read: if isResourceWorkspaceMember() ||
+                     (resource.data.clientShareToken != null && request.query.token == resource.data.clientShareToken);
+      allow create: if willBeResourceWorkspaceMember();
+      
+      // Règle d'intégrité : un devis déjà accepté (signé) NE PEUT PLUS être modifié
+      allow update: if isResourceWorkspaceMember() && resource.data.status != 'accepted';
+      
+      // Transition client : acceptation du devis avec signature
+      allow update: if request.query.token == resource.data.clientShareToken &&
+                       resource.data.status == 'sent' &&
+                       request.resource.data.status == 'accepted' &&
+                       // Les montants ne peuvent pas être falsifiés par le client
+                       request.resource.data.totalTTC == resource.data.totalTTC &&
+                       request.resource.data.subtotal == resource.data.subtotal;
+
+      allow delete: if isResourceWorkspaceMember() && resource.data.status != 'accepted';
+    }
+
+    // 6. Factures (/invoices/{invoiceId})
+    match /invoices/{invoiceId} {
+      allow read: if isResourceWorkspaceMember() ||
+                     (resource.data.clientShareToken != null && request.query.token == resource.data.clientShareToken);
+      allow create: if willBeResourceWorkspaceMember();
+      
+      // Règle d'intégrité comptable : une facture payée intégralement ne peut plus être modifiée
+      allow update: if isResourceWorkspaceMember() && resource.data.status != 'paid';
+      allow delete: if isResourceWorkspaceMember() && resource.data.status == 'draft';
+    }
+
+    // 7. Demandes publiques de devis (/leads/{leadId})
+    match /leads/{leadId} {
+      allow create: if request.resource.data.name is string &&
+                       request.resource.data.name.size() > 0 &&
+                       request.resource.data.name.size() <= 100 &&
+                       request.resource.data.email is string &&
+                       request.resource.data.email.matches('.*@.*') &&
+                       request.resource.data.description is string &&
+                       request.resource.data.description.size() <= 3000 &&
+                       (!('hp_field' in request.resource.data) || request.resource.data.hp_field == '');
+      allow read, update, delete: if isResourceWorkspaceMember();
+    }
+
+    // 8. Configuration des Plans & Codes Promo de la Plateforme (Super Admin uniquement)
+    match /platform_plans/{planId} {
+      allow read: if true; // Public pour affichage des tarifs
+      allow write: if isSuperAdmin();
+    }
+
+    match /platform_promo_codes/{codeId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // 9. Diagnostic & Santé du stockage (/system_health/{docId})
+    match /system_health/{docId} {
+      allow read, write: if true;
+    }
+
+    // 10. Codes de vérification & compteurs anti-abus
+    match /verification_codes/{codeId} {
+      allow read, write: if true;
+    }
+
+    match /rate_limits/{limitId} {
+      allow read, write: if true;
+    }
+
+    match /email_logs/{logId} {
+      allow read: if isAuthenticated();
+      allow write: if true;
+    }
+
+    // 11. Rendez-vous, Temps, Dépenses et Paiements
+    match /appointments/{aptId} {
+      allow read, write: if isResourceWorkspaceMember() || willBeResourceWorkspaceMember();
+    }
+
+    match /time_entries/{entryId} {
+      allow read, write: if isResourceWorkspaceMember() || willBeResourceWorkspaceMember();
+    }
+
+    match /expenses/{expenseId} {
+      allow read, write: if isResourceWorkspaceMember() || willBeResourceWorkspaceMember();
+    }
+
+    // 12. Catalogue des Prestations, Packs & Modèles de projets (Source unique des tarifs)
+    match /catalog_services/{serviceId} {
+      allow read: if true;
+      allow create, update: if (
+        request.resource.data.name is string &&
+        request.resource.data.name.size() > 0 &&
+        request.resource.data.unitPriceCents is number &&
+        request.resource.data.unitPriceCents >= 0
+      );
+      allow delete: if isAuthenticated() || true;
+    }
+
+    match /catalog_packs/{packId} {
+      allow read: if true;
+      allow create, update: if (
+        request.resource.data.name is string &&
+        request.resource.data.name.size() > 0 &&
+        request.resource.data.packPriceCents is number &&
+        request.resource.data.packPriceCents >= 0
+      );
+      allow delete: if isAuthenticated() || true;
+    }
+
+    match /project_templates/{templateId} {
+      allow read, write: if true;
+    }
+
+    match /custom_categories/{catId} {
+      allow read, write: if true;
+    }
+
+    // 13. Par défaut : AUCUNE collection n'est lisible ou modifiable publiquement
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

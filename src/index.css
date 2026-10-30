@@ -1,0 +1,544 @@
+@import "tailwindcss";
+
+:root {
+  --font-family: 'Switzer', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --accent-gold: #f7c548;
+  --accent-gold-hover: #e5b336;
+}
+
+/* ==========================================================================
+   1. DARK MODE PALETTE (Strict Design System: Aurelia / Nebula)
+   ========================================================================== */
+:root, [data-theme="dark"], html.dark, .dark {
+  --bg-main: #0f0326;
+  --sidebar-bg: #160830;
+  --header-bg: #160830;
+  --card-surface: #1a0a3a;
+  --card-surface-elevated: #25124d;
+  --card-surface-alt: #160830;
+  --text-primary: #eeebd3;
+  --text-secondary: #8a7968;
+  --border-color: rgba(138, 121, 104, 0.25);
+  --border-card: rgba(138, 121, 104, 0.16);
+  --border-subtle: rgba(138, 121, 104, 0.12);
+  --border-hover: rgba(247, 197, 72, 0.4);
+  --input-bg: #160830;
+  --input-border: rgba(138, 121, 104, 0.3);
+  --dropdown-bg: #25124d;
+  --dropdown-hover: rgba(247, 197, 72, 0.12);
+  --badge-gold-bg: rgba(247, 197, 72, 0.15);
+  --badge-gold-text: #f7c548;
+  --shadow-card: 0 10px 30px -10px rgba(15, 3, 38, 0.5);
+  --chart-track: rgba(255, 255, 255, 0.08);
+}
+
+/* ==========================================================================
+   2. LIGHT MODE PALETTE (Strict Design System: Lumina)
+   ========================================================================== */
+[data-theme="light"], html.light, .light {
+  --bg-main: #faf7f0;
+  --sidebar-bg: #faf7f0;
+  --header-bg: #ffffff;
+  --card-surface: #ffffff;
+  --card-surface-elevated: #f5ede0;
+  --card-surface-alt: #f6f1e7;
+  --text-primary: #1d1335;
+  --text-secondary: #7a6c62;
+  --border-color: rgba(138, 121, 104, 0.24);
+  --border-card: rgba(138, 121, 104, 0.15);
+  --border-subtle: rgba(138, 121, 104, 0.12);
+  --border-hover: rgba(247, 197, 72, 0.55);
+  --input-bg: #ffffff;
+  --input-border: rgba(138, 121, 104, 0.28);
+  --dropdown-bg: #ffffff;
+  --dropdown-hover: #fef4db;
+  --badge-gold-bg: #fef4db;
+  --badge-gold-text: #b37d0c;
+  --shadow-card: 0 8px 24px -8px rgba(29, 19, 53, 0.08);
+  --chart-track: rgba(138, 121, 104, 0.15);
+}
+
+body {
+  background-color: var(--bg-main);
+  color: var(--text-primary);
+  font-family: var(--font-family);
+  transition: background-color 0.25s ease, color 0.25s ease;
+}
+
+/* Typography Helpers */
+.font-display {
+  font-family: var(--font-family);
+  letter-spacing: -0.02em;
+}
+
+.font-sans {
+  font-family: var(--font-family);
+}
+
+.font-mono {
+  font-family: 'JetBrains Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Global Panels & Cards */
+.glass-panel {
+  background-color: var(--card-surface);
+  border: 1px solid var(--border-card);
+  border-radius: 1rem;
+  box-shadow: var(--shadow-card);
+  transition: background-color 0.2s ease, border-color 0.2s ease;
+}
+
+.glass-panel-alt {
+  background-color: var(--card-surface-alt);
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.75rem;
+  transition: background-color 0.2s ease, border-color 0.2s ease;
+}
+
+.glass-panel-elevated {
+  background-color: var(--card-surface-elevated);
+  border: 1px solid var(--border-color);
+  border-radius: 1rem;
+  box-shadow: var(--shadow-card);
+}
+
+.glass-panel-hover {
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.glass-panel-hover:hover {
+  border-color: var(--border-hover);
+  box-shadow: var(--shadow-card);
+}
+
+/* Modal Dialogs */
+.glass-modal {
+  background-color: var(--card-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border-card);
+  border-radius: 1.5rem;
+  box-shadow: 0 25px 50px -12px rgba(15, 3, 38, 0.4);
+}
+
+/* Input & Button Design System Classes */
+.glass-input {
+  background-color: var(--input-bg);
+  color: var(--text-primary);
+  border: 1px solid var(--input-border);
+  border-radius: 0.75rem;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.2s ease;
+}
+
+.glass-input:focus {
+  border-color: var(--accent-gold) !important;
+  box-shadow: 0 0 0 2px rgba(247, 197, 72, 0.2) !important;
+}
+
+.glass-btn-secondary {
+  background-color: var(--card-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 0.75rem;
+  transition: all 0.15s ease;
+}
+
+.glass-btn-secondary:hover {
+  background-color: var(--card-surface-elevated);
+  border-color: var(--border-hover);
+}
+
+.glass-nav {
+  background-color: var(--sidebar-bg);
+  border-color: var(--border-subtle);
+}
+
+/* Global Form Elements & Native Dropdowns */
+select, 
+.app-select {
+  background-color: var(--input-bg);
+  color: var(--text-primary);
+  border: 1px solid var(--input-border);
+  border-radius: 0.75rem;
+  padding: 0.5rem 0.85rem;
+  font-family: var(--font-family);
+  font-size: 0.75rem;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.2s ease;
+}
+
+select:focus,
+.app-select:focus {
+  border-color: var(--accent-gold);
+  box-shadow: 0 0 0 2px rgba(247, 197, 72, 0.2);
+}
+
+select option {
+  background-color: var(--dropdown-bg);
+  color: var(--text-primary);
+}
+
+input[type="text"],
+input[type="email"],
+input[type="password"],
+input[type="number"],
+input[type="date"],
+input[type="tel"],
+input[type="url"],
+input[type="search"],
+textarea {
+  background-color: var(--input-bg);
+  color: var(--text-primary);
+  border: 1px solid var(--input-border);
+  font-family: var(--font-family);
+  border-radius: 0.75rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.2s ease;
+}
+
+input:focus,
+textarea:focus {
+  border-color: var(--accent-gold) !important;
+  box-shadow: 0 0 0 2px rgba(247, 197, 72, 0.2) !important;
+}
+
+/* ==========================================================================
+   3. UNIVERSAL LIGHT MODE SYSTEMIC REFINEMENTS (Lumina Cohesion)
+   Transforms all legacy hardcoded dark classes into crisp Lumina elements
+   when Light Mode is active, guaranteeing 100% legibility across every screen.
+   ========================================================================== */
+html.light,
+[data-theme="light"],
+.light {
+  color: var(--text-primary);
+}
+
+/* Transform text-white into crisp dark plum text in light mode */
+html.light .text-white,
+[data-theme="light"] .text-white,
+.light .text-white,
+html.light .text-white\/90,
+[data-theme="light"] .text-white\/90,
+.light .text-white\/90 {
+  color: #1d1335 !important;
+}
+
+html.light .text-white\/80,
+html.light .text-white\/70,
+html.light .text-white\/60,
+[data-theme="light"] .text-white\/80,
+[data-theme="light"] .text-white\/70,
+[data-theme="light"] .text-white\/60,
+.light .text-white\/80,
+.light .text-white\/70,
+.light .text-white\/60 {
+  color: #7a6c62 !important;
+}
+
+html.light .text-white\/50,
+html.light .text-white\/40,
+html.light .text-white\/30,
+[data-theme="light"] .text-white\/50,
+[data-theme="light"] .text-white\/40,
+[data-theme="light"] .text-white\/30,
+.light .text-white\/50,
+.light .text-white\/40,
+.light .text-white\/30 {
+  color: rgba(122, 108, 98, 0.6) !important;
+}
+
+/* Hovering text-white in light mode */
+html.light .hover\:text-white:hover,
+[data-theme="light"] .hover\:text-white:hover,
+.light .hover\:text-white:hover {
+  color: #1d1335 !important;
+}
+
+/* Exceptions: Elements that MUST retain white text (e.g. red danger buttons, dark badges) */
+html.light .bg-red-500 .text-white,
+html.light .bg-red-600 .text-white,
+html.light [class*="bg-red-"] .text-white,
+html.light [class*="bg-[#d9"] .text-white,
+html.light [class*="bg-[#D9"] .text-white,
+html.light .bg-[#0f0326] .text-white,
+html.light .bg-[#0B0F1A] .text-white,
+html.light .btn-danger,
+[data-theme="light"] [class*="bg-red"] .text-white,
+[data-theme="light"] [class*="bg-[#d9"] .text-white,
+[data-theme="light"] [class*="bg-[#D9"] .text-white {
+  color: #ffffff !important;
+}
+
+/* Soft cream text becomes dark plum in light mode */
+html.light .text-\[\#eeebd3\],
+[data-theme="light"] .text-\[\#eeebd3\],
+.light .text-\[\#eeebd3\],
+html.light .text-\[\#F1F3F8\],
+[data-theme="light"] .text-\[\#F1F3F8\],
+.light .text-\[\#F1F3F8\] {
+  color: #1d1335 !important;
+}
+
+/* Taupe labels become high-contrast warm taupe in light mode */
+html.light .text-\[\#8E97AB\],
+[data-theme="light"] .text-\[\#8E97AB\],
+.light .text-\[\#8E97AB\],
+html.light .text-\[\#8a7968\],
+[data-theme="light"] .text-\[\#8a7968\],
+.light .text-\[\#8a7968\],
+html.light .text-\[\#A6AFC2\],
+[data-theme="light"] .text-\[\#A6AFC2\],
+.light .text-\[\#A6AFC2\] {
+  color: #7a6c62 !important;
+}
+
+/* Universal Gold Enforcement for all themes */
+.text-\[\#f7c548\],
+.text-\[\#C9A96E\],
+.text-\[\#c9a96e\] {
+  color: #f7c548;
+}
+
+.bg-\[\#f7c548\],
+.bg-\[\#C9A96E\],
+.bg-\[\#c9a96e\] {
+  background-color: #f7c548;
+}
+
+.border-\[\#f7c548\],
+.border-\[\#C9A96E\],
+.border-\[\#c9a96e\] {
+  border-color: #f7c548;
+}
+
+/* Gold text token in light mode: deep warm golden taupe for high contrast */
+html.light .text-\[\#f7c548\],
+[data-theme="light"] .text-\[\#f7c548\],
+.light .text-\[\#f7c548\],
+html.light .text-\[\#C9A96E\],
+[data-theme="light"] .text-\[\#C9A96E\],
+.light .text-\[\#C9A96E\] {
+  color: #b37d0c !important;
+}
+
+/* Deep app backgrounds -> #faf7f0 (Soft Warm Ivory) */
+html.light .bg-\[\#0f0326\],
+[data-theme="light"] .bg-\[\#0f0326\],
+.light .bg-\[\#0f0326\],
+html.light .bg-\[\#0B0F1A\],
+[data-theme="light"] .bg-\[\#0B0F1A\],
+.light .bg-\[\#0B0F1A\],
+html.light .bg-\[\#0E1426\],
+[data-theme="light"] .bg-\[\#0E1426\],
+.light .bg-\[\#0E1426\],
+html.light .bg-\[\#0a0f1d\],
+[data-theme="light"] .bg-\[\#0a0f1d\],
+.light .bg-\[\#0a0f1d\] {
+  background-color: #faf7f0 !important;
+}
+
+/* Legacy dark card surfaces -> Crisp White #ffffff */
+html.light .bg-\[\#1a0a3a\],
+[data-theme="light"] .bg-\[\#1a0a3a\],
+.light .bg-\[\#1a0a3a\],
+html.light .bg-\[\#121826\],
+[data-theme="light"] .bg-\[\#121826\],
+.light .bg-\[\#121826\],
+html.light .bg-\[\#121A2B\],
+[data-theme="light"] .bg-\[\#121A2B\],
+.light .bg-\[\#121A2B\],
+html.light .bg-\[\#151C2C\],
+[data-theme="light"] .bg-\[\#151C2C\],
+.light .bg-\[\#151C2C\],
+html.light .bg-\[\#161F30\],
+[data-theme="light"] .bg-\[\#161F30\],
+.light .bg-\[\#161F30\] {
+  background-color: #ffffff !important;
+}
+
+/* Inputs & secondary containers -> #ffffff or #f6f1e7 */
+html.light .bg-\[\#160830\],
+[data-theme="light"] .bg-\[\#160830\],
+.light .bg-\[\#160830\],
+html.light .bg-\[\#1E293B\],
+[data-theme="light"] .bg-\[\#1E293B\],
+.light .bg-\[\#1E293B\],
+html.light .bg-\[\#111625\],
+[data-theme="light"] .bg-\[\#111625\],
+.light .bg-\[\#111625\],
+html.light .bg-\[\#1c2438\],
+[data-theme="light"] .bg-\[\#1c2438\],
+.light .bg-\[\#1c2438\] {
+  background-color: #f6f1e7 !important;
+}
+
+/* Elevated hover surfaces -> #f5ede0 */
+html.light .bg-\[\#25124d\],
+[data-theme="light"] .bg-\[\#25124d\],
+.light .bg-\[\#25124d\],
+html.light .bg-\[\#1f293d\],
+[data-theme="light"] .bg-\[\#1f293d\],
+.light .bg-\[\#1f293d\] {
+  background-color: #f5ede0 !important;
+}
+
+/* Translucent white layers in dark mode convert to gentle warm taupe in light mode */
+html.light [class*="bg-white/"],
+[data-theme="light"] [class*="bg-white/"],
+.light [class*="bg-white/"] {
+  background-color: rgba(138, 121, 104, 0.08) !important;
+}
+
+html.light .hover\:bg-white\/5:hover,
+html.light .hover\:bg-white\/10:hover,
+html.light .hover\:bg-white\/15:hover,
+[data-theme="light"] .hover\:bg-white\/5:hover,
+[data-theme="light"] .hover\:bg-white\/10:hover,
+[data-theme="light"] .hover\:bg-white\/15:hover,
+.light .hover\:bg-white\/5:hover,
+.light .hover\:bg-white\/10:hover,
+.light .hover\:bg-white\/15:hover {
+  background-color: #f5ede0 !important;
+}
+
+/* Gold primary buttons always remain vivid golden yellow with dark text */
+html.light .bg-\[\#f7c548\],
+[data-theme="light"] .bg-\[\#f7c548\],
+.light .bg-\[\#f7c548\],
+html.light .bg-\[\#C9A96E\],
+[data-theme="light"] .bg-\[\#C9A96E\],
+.light .bg-\[\#C9A96E\] {
+  background-color: #f7c548 !important;
+  color: #0f0326 !important;
+}
+
+html.light .hover\:bg-\[\#e5b336\]:hover,
+[data-theme="light"] .hover\:bg-\[\#e5b336\]:hover,
+.light .hover\:bg-\[\#e5b336\]:hover,
+html.light .hover\:bg-\[\#D8BC84\]:hover,
+[data-theme="light"] .hover\:bg-\[\#D8BC84\]:hover,
+.light .hover\:bg-\[\#D8BC84\]:hover {
+  background-color: #e5b336 !important;
+}
+
+/* Universal Borders in Light Mode */
+html.light .border-\[\#1E293B\],
+[data-theme="light"] .border-\[\#1E293B\],
+.light .border-\[\#1E293B\],
+html.light .border-\[\#1e293b\],
+[data-theme="light"] .border-\[\#1e293b\],
+.light .border-\[\#1e293b\],
+html.light [class*="border-white/"],
+[data-theme="light"] [class*="border-white/"],
+.light [class*="border-white/"],
+html.light [class*="border-[#8a7968]/"],
+[data-theme="light"] [class*="border-[#8a7968]/"],
+.light [class*="border-[#8a7968]/"] {
+  border-color: rgba(138, 121, 104, 0.22) !important;
+}
+
+html.light .border-\[\#f7c548\],
+[data-theme="light"] .border-\[\#f7c548\],
+.light .border-\[\#f7c548\],
+html.light .border-\[\#f7c548\],
+[data-theme="light"] .border-\[\#f7c548\],
+.light .border-\[\#f7c548\] {
+  border-color: rgba(247, 197, 72, 0.6) !important;
+}
+
+html.light [class*="divide-white/"] > :not([hidden]) ~ :not([hidden]),
+[data-theme="light"] [class*="divide-white/"] > :not([hidden]) ~ :not([hidden]) {
+  border-color: rgba(138, 121, 104, 0.16) !important;
+}
+
+/* Badges with specific status styling in Light Mode */
+html.light .bg-\[\#5FB59A\]\/20,
+[data-theme="light"] .bg-\[\#5FB59A\]\/20 {
+  background-color: rgba(34, 153, 119, 0.15) !important;
+}
+
+html.light .text-\[\#5FB59A\],
+[data-theme="light"] .text-\[\#5FB59A\] {
+  color: #15795b !important;
+}
+
+html.light .bg-\[\#D9695F\]\/20,
+[data-theme="light"] .bg-\[\#D9695F\]\/20 {
+  background-color: rgba(217, 105, 95, 0.15) !important;
+}
+
+html.light .text-\[\#D9695F\],
+[data-theme="light"] .text-\[\#D9695F\] {
+  color: #b5382e !important;
+}
+
+/* Form inputs & textarea in Light Mode */
+html.light input,
+[data-theme="light"] input,
+.light input,
+html.light select,
+[data-theme="light"] select,
+.light select,
+html.light textarea,
+[data-theme="light"] textarea,
+.light textarea {
+  background-color: #ffffff !important;
+  color: #1d1335 !important;
+  border-color: rgba(138, 121, 104, 0.28) !important;
+}
+
+html.light input::placeholder,
+[data-theme="light"] input::placeholder,
+.light input::placeholder,
+html.light textarea::placeholder,
+[data-theme="light"] textarea::placeholder,
+.light textarea::placeholder {
+  color: #7a6c62 !important;
+}
+
+html.light select option,
+[data-theme="light"] select option,
+.light select option {
+  background-color: #ffffff !important;
+  color: #1d1335 !important;
+}
+
+/* Modals & Dialogs in Light Mode */
+html.light .glass-modal,
+[data-theme="light"] .glass-modal,
+.light .glass-modal {
+  background-color: #ffffff !important;
+  color: #1d1335 !important;
+  border-color: rgba(138, 121, 104, 0.20) !important;
+}
+
+html.light .fixed.inset-0.bg-black\/80,
+html.light .fixed.inset-0.bg-black\/75,
+[data-theme="light"] .fixed.inset-0.bg-black\/80,
+[data-theme="light"] .fixed.inset-0.bg-black\/75 {
+  background-color: rgba(29, 19, 53, 0.5) !important;
+}
+
+/* Table rows on hover in Light Mode */
+html.light tr:hover,
+[data-theme="light"] tr:hover,
+.light tr:hover {
+  background-color: #f5ede0 !important;
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(138, 121, 104, 0.3);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-gold);
+}

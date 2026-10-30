@@ -1,0 +1,81 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Freelance graphic designer account profile and settings",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "name": { "type": "string", "maxLength": 100 },
+        "studioName": { "type": "string", "maxLength": 120 },
+        "email": { "type": "string", "format": "email" },
+        "phone": { "type": "string", "maxLength": 30 },
+        "siret": { "type": "string", "maxLength": 30 },
+        "address": { "type": "string", "maxLength": 200 },
+        "currency": { "type": "string", "maxLength": 10 },
+        "vatRate": { "type": "number" },
+        "quotePrefix": { "type": "string", "maxLength": 15 },
+        "invoicePrefix": { "type": "string", "maxLength": 15 },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["userId", "name", "email"]
+    },
+    "Client": {
+      "title": "Client",
+      "description": "Graphic designer client record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "ownerId": { "type": "string" },
+        "name": { "type": "string", "maxLength": 100 },
+        "company": { "type": "string", "maxLength": 120 },
+        "email": { "type": "string", "format": "email" },
+        "phone": { "type": "string", "maxLength": 30 },
+        "address": { "type": "string", "maxLength": 250 },
+        "website": { "type": "string", "maxLength": 150 },
+        "privateNotes": { "type": "string", "maxLength": 2000 },
+        "status": { "type": "string", "enum": ["active", "prospect", "archived"] },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "ownerId", "name", "company", "email"]
+    },
+    "Project": {
+      "title": "Project",
+      "description": "Graphic design project with creative brief and step tracking",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "ownerId": { "type": "string" },
+        "clientId": { "type": "string" },
+        "clientShareToken": { "type": "string", "maxLength": 64 },
+        "title": { "type": "string", "maxLength": 150 },
+        "type": { "type": "string", "enum": ["logo", "affiche", "flyer", "carte_visite", "identite_visuelle", "emballage", "reseaux_sociaux", "autre"] },
+        "budget": { "type": "number" },
+        "depositAmount": { "type": "number" },
+        "deadline": { "type": "string" },
+        "currentStep": { "type": "string" },
+        "revisionLimit": { "type": "number" },
+        "revisionsUsed": { "type": "number" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "ownerId", "clientId", "clientShareToken", "title", "type", "currentStep"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profile document containing studio and invoice configuration"
+    },
+    "/clients/{clientId}": {
+      "schema": "Client",
+      "description": "Client directory documents owned by the designer"
+    },
+    "/projects/{projectId}": {
+      "schema": "Project",
+      "description": "Main project document with lifecycle status and brief details"
+    }
+  }
+}

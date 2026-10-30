@@ -1,0 +1,59 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isSuperAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.email == 'ouattaraabdoulaye479@gmail.com' ||
+        request.auth.token.role == 'superadmin' ||
+        request.auth.token.isSuperAdmin == true
+      );
+    }
+
+    function isInWorkspace(workspaceId) {
+      return isAuthenticated() && (
+        request.auth.token.workspaceId == workspaceId ||
+        isSuperAdmin()
+      );
+    }
+
+    // Interdiction stricte de tout format exécutable ou dangereux
+    function isSafeFile() {
+      return !(request.resource.name.matches('.*\\.(exe|sh|php|js|bat|cmd|vbs|py|bin|jar|msi|html|htm|cgi|pl|phtml)')) &&
+             !(request.resource.contentType.matches('application/x-msdownload|application/x-executable|application/javascript|text/html|application/x-sh'));
+    }
+
+    // Limite de taille stricte (50 Mo maximum)
+    function isValidSize() {
+      return request.resource.size <= 50 * 1024 * 1024;
+    }
+
+    // 1. Fichiers du workspace et logos
+    match /workspaces/{workspaceId}/branding/{fileName} {
+      allow read: if true; // Logo public
+      allow write: if isInWorkspace(workspaceId) && isSafeFile() && isValidSize();
+    }
+
+    // 2. Fichiers projets (maquettes & ressources partagées)
+    match /workspaces/{workspaceId}/projects/{projectId}/mockups/{fileName} {
+      allow read: if true; // Consultable via token dans l'espace client
+      allow write: if isInWorkspace(workspaceId) && isSafeFile() && isValidSize();
+    }
+
+    // 3. Livrables finaux haute définition (verrouillés)
+    match /workspaces/{workspaceId}/projects/{projectId}/deliverables/{fileName} {
+      allow read: if isInWorkspace(workspaceId);
+      allow write: if isInWorkspace(workspaceId) && isSafeFile() && isValidSize();
+      allow delete: if isInWorkspace(workspaceId);
+    }
+
+    // 4. Par défaut : refus total
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
