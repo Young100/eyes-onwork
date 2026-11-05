@@ -93,7 +93,7 @@ export const StatsView: React.FC = () => {
             <span className="p-2 rounded-xl bg-[#f7c548]/20 text-[#f7c548]">
               <BarChart3 className="w-5 h-5" />
             </span>
-            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-white font-display">
+            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-[var(--text-primary)] font-display">
               Statistiques & Gestion
             </h1>
           </div>
@@ -110,7 +110,7 @@ export const StatsView: React.FC = () => {
                 key={p}
                 onClick={() => setPeriod(p)}
                 className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
-                  period === p ? 'bg-[#f7c548] text-[#0B0F1A]' : 'text-[#8E97AB] hover:text-white'
+                  period === p ? 'bg-[#f7c548] text-[#0B0F1A]' : 'text-[#8E97AB] hover:text-[var(--text-primary)]'
                 }`}
               >
                 {p === '30d' && '30 jours'}
@@ -136,7 +136,7 @@ export const StatsView: React.FC = () => {
         <div className="glass-panel p-4 flex flex-col justify-between">
           <span className="text-xs text-[#8E97AB]">Total facturé</span>
           <div className="my-2">
-            <span className="text-xl sm:text-2xl font-bold text-white font-display tabular-nums">
+            <span className="text-xl sm:text-2xl font-bold text-[var(--text-primary)] font-display tabular-nums">
               {formatMontant(totalInvoiced, profile.currency, 0)}
             </span>
           </div>
@@ -173,7 +173,7 @@ export const StatsView: React.FC = () => {
         <div className="glass-panel p-4 flex flex-col justify-between">
           <span className="text-xs text-[#8E97AB]">Taux d'acceptation</span>
           <div className="my-2">
-            <span className="text-xl sm:text-2xl font-bold text-white font-display tabular-nums">
+            <span className="text-xl sm:text-2xl font-bold text-[var(--text-primary)] font-display tabular-nums">
               {acceptanceRate} %
             </span>
           </div>
@@ -190,7 +190,7 @@ export const StatsView: React.FC = () => {
           <div className="flex items-center justify-between pb-3 border-b border-white/10">
             <div className="flex items-center gap-2">
               <Users className="w-4 h-4 text-[#f7c548]" />
-              <h3 className="text-xs font-bold uppercase tracking-wider text-white font-display">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-[var(--text-primary)] font-display">
                 Clients les plus rentables
               </h3>
             </div>
@@ -199,12 +199,12 @@ export const StatsView: React.FC = () => {
 
           <div className="space-y-3">
             {topClients.map((cl, idx) => (
-              <div key={idx} className="flex items-center justify-between p-3 rounded-xl bg-white/[0.02] border border-white/5 text-xs">
+              <div key={idx} className="flex items-center justify-between p-3 rounded-xl bg-[var(--card-surface-elevated)] border border-[var(--border-subtle)] text-xs">
                 <div className="flex items-center gap-2.5">
                   <span className="w-5 h-5 rounded-full bg-[#f7c548]/20 text-[#f7c548] flex items-center justify-center font-bold text-[10px]">
                     {idx + 1}
                   </span>
-                  <span className="font-bold text-white font-display">{cl.name}</span>
+                  <span className="font-bold text-[var(--text-primary)] font-display">{cl.name}</span>
                 </div>
                 <span className="font-bold text-[#f7c548] font-mono tabular-nums">
                   {formatMontant(cl.total, profile.currency)}
@@ -217,9 +217,9 @@ export const StatsView: React.FC = () => {
         {/* Data Exports Card */}
         <div className="glass-panel p-5 sm:p-6 space-y-4 flex flex-col justify-between">
           <div className="space-y-2">
-            <div className="flex items-center gap-2 pb-3 border-b border-white/10">
+            <div className="flex items-center gap-2 pb-3 border-b border-[var(--border-subtle)]">
               <Download className="w-4 h-4 text-[#5FB59A]" />
-              <h3 className="text-xs font-bold uppercase tracking-wider text-white font-display">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-[var(--text-primary)] font-display">
                 Exports comptables standards (CSV & Excel)
               </h3>
             </div>

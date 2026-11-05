@@ -136,10 +136,10 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
   // Filtered clients list
   const filteredClients = clients.filter(c => {
     const matchesSearch = 
-      c.name.toLowerCase().includes(search.toLowerCase()) ||
-      c.company.toLowerCase().includes(search.toLowerCase()) ||
-      c.email.toLowerCase().includes(search.toLowerCase()) ||
-      (c.phone && c.phone.includes(search));
+      (c.name || '').toLowerCase().includes(search.toLowerCase()) ||
+      (c.company || '').toLowerCase().includes(search.toLowerCase()) ||
+      (c.email || '').toLowerCase().includes(search.toLowerCase()) ||
+      Boolean(c.phone && c.phone.includes(search));
 
     const matchesStatus = statusFilter === 'all' || c.status === statusFilter;
     return matchesSearch && matchesStatus;
@@ -293,18 +293,18 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
       {/* Top action & filter bar */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-white font-display flex items-center gap-2.5">
+          <h1 className="text-2xl font-bold tracking-tight text-[var(--text-primary)] font-display flex items-center gap-2.5">
             <Users className="w-6 h-6 text-[#f7c548]" />
             <span>Fiches Clients ({clients.length})</span>
           </h1>
-          <p className="text-xs sm:text-sm text-[#8E97AB] mt-0.5">
+          <p className="text-xs sm:text-sm text-[var(--text-secondary)] mt-0.5">
             Répertoire centralisé, projets rattachés, devis, factures et suivi relationnel.
           </p>
         </div>
 
         <button
           onClick={onOpenCreateModal}
-          className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-xs font-semibold text-[#0B0F1A] bg-[#f7c548] hover:bg-[#e5b336] active:scale-[0.98] transition-all shadow-md shadow-[#f7c548]/20 cursor-pointer self-start sm:self-auto"
+          className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-xs font-semibold text-[#0f0326] bg-[#f7c548] hover:bg-[#e5b336] active:scale-[0.98] transition-all shadow-md shadow-[#f7c548]/20 cursor-pointer self-start sm:self-auto"
         >
           <Plus className="w-4 h-4 stroke-[2.5]" />
           <span>Nouveau client</span>
@@ -318,10 +318,10 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
             <UserPlus className="w-8 h-8 stroke-[1.5]" />
           </div>
           <div className="space-y-1">
-            <h2 className="text-xl font-bold text-white font-display">
+            <h2 className="text-xl font-bold text-[var(--text-primary)] font-display">
               Aucun client pour l'instant
             </h2>
-            <p className="text-xs sm:text-sm text-[#8E97AB] leading-relaxed">
+            <p className="text-xs sm:text-sm text-[var(--text-secondary)] leading-relaxed">
               Ajoutez votre premier client pour commencer à gérer vos dossiers, devis et factures rattachés.
             </p>
           </div>
@@ -363,15 +363,15 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
               </div>
 
               {/* Segmented status filter */}
-              <div className="flex items-center gap-1 p-1 bg-white/[0.04] border border-white/10 rounded-xl">
+              <div className="flex items-center gap-1 p-1 bg-[var(--card-surface-elevated)] border border-[var(--border-subtle)] rounded-xl">
                 {(['all', 'active', 'prospect', 'archived'] as const).map((st) => (
                   <button
                     key={st}
                     onClick={() => setStatusFilter(st)}
                     className={`flex-1 py-1.5 text-[11px] font-semibold rounded-lg transition-colors cursor-pointer capitalize ${
                       statusFilter === st
-                        ? 'bg-white/15 text-white shadow-xs'
-                        : 'text-[#8E97AB] hover:text-white'
+                        ? 'bg-[var(--card-surface)] text-[var(--text-primary)] shadow-sm'
+                        : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
                     }`}
                   >
                     {st === 'all' ? 'Tous' : st === 'active' ? 'Actifs' : st === 'prospect' ? 'Prospects' : 'Archivés'}
@@ -394,31 +394,31 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
                     className={`
                       p-3.5 rounded-2xl cursor-pointer transition-all duration-200 border
                       ${isSelected 
-                        ? 'bg-white/[0.09] border-[#f7c548]/60 shadow-lg shadow-black/30' 
-                        : 'bg-white/[0.03] hover:bg-white/[0.06] border-white/10'}
+                        ? 'bg-[var(--card-surface-elevated)] border-[#f7c548]/60 shadow-lg shadow-black/10' 
+                        : 'bg-[var(--card-surface)] hover:bg-[var(--card-surface-elevated)] border-[var(--border-subtle)]'}
                     `}
                   >
                     <div className="flex items-start justify-between gap-2">
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
-                          <h3 className="text-xs font-bold text-white font-display truncate">
+                          <h3 className="text-xs font-bold text-[var(--text-primary)] font-display truncate">
                             {client.company}
                           </h3>
                           <span className={`w-2 h-2 rounded-full shrink-0 ${
                             client.status === 'active' ? 'bg-[#5FB59A]' : client.status === 'prospect' ? 'bg-[#f7c548]' : 'bg-neutral-500'
                           }`} />
                         </div>
-                        <div className="text-[11px] text-[#8E97AB] truncate mt-0.5">
+                        <div className="text-[11px] text-[var(--text-secondary)] truncate mt-0.5">
                           {client.name} · {client.email}
                         </div>
                       </div>
 
                       <div className="flex flex-col items-end gap-1 shrink-0">
-                        <span className="text-[10px] px-2 py-0.5 rounded bg-white/10 text-white font-medium">
+                        <span className="text-[10px] px-2 py-0.5 rounded bg-[var(--badge-gold-bg)] text-[var(--badge-gold-text)] font-semibold border border-[#f7c548]/20">
                           {pCount} {pCount > 1 ? 'projets' : 'projet'}
                         </span>
                         {qCount > 0 && (
-                          <span className="text-[9px] text-[#8E97AB]">
+                          <span className="text-[9px] text-[var(--text-secondary)]">
                             {qCount} devis
                           </span>
                         )}
@@ -429,7 +429,7 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
               })}
 
               {filteredClients.length === 0 && (
-                <div className="glass-panel p-8 text-center text-xs text-[#8E97AB]">
+                <div className="glass-panel p-8 text-center text-xs text-[var(--text-secondary)]">
                   Aucun client ne correspond à votre recherche.
                 </div>
               )}
@@ -442,14 +442,14 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
               <div className="glass-panel p-5 sm:p-6 space-y-6">
                 
                 {/* 1. Header Profile with Contact details & Quick call/WhatsApp/Email buttons */}
-                <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4 pb-5 border-b border-white/10">
+                <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4 pb-5 border-b border-[var(--border-subtle)]">
                   <div className="flex items-start gap-3 min-w-0">
-                    <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-[#1A253E] to-[#0E1626] border border-[#f7c548]/50 flex items-center justify-center text-[#f7c548] font-bold text-xl font-display shadow-md shrink-0">
+                    <div className="w-14 h-14 rounded-2xl bg-[var(--card-surface-elevated)] border border-[#f7c548]/50 flex items-center justify-center text-[#f7c548] font-bold text-xl font-display shadow-md shrink-0">
                       {selectedClient.company.slice(0, 2).toUpperCase()}
                     </div>
                     <div className="min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
-                        <h2 className="text-xl font-bold text-white font-display truncate">
+                        <h2 className="text-xl font-bold text-[var(--text-primary)] font-display truncate">
                           {selectedClient.company}
                         </h2>
                         <span className={`text-[10px] px-2 py-0.5 rounded font-semibold capitalize ${
@@ -457,13 +457,13 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
                             ? 'bg-[#5FB59A]/15 text-[#5FB59A] border border-[#5FB59A]/30' 
                             : selectedClient.status === 'prospect'
                             ? 'bg-[#f7c548]/15 text-[#f7c548] border border-[#f7c548]/30'
-                            : 'bg-white/10 text-[#8E97AB] border border-white/20'
+                            : 'bg-[var(--card-surface-elevated)] text-[var(--text-secondary)] border border-[var(--border-subtle)]'
                         }`}>
                           {selectedClient.status === 'active' ? 'Client actif' : selectedClient.status === 'prospect' ? 'Prospect' : 'Archivé'}
                         </span>
                       </div>
-                      <p className="text-xs text-[#8E97AB] mt-0.5">
-                        Interlocuteur : <strong className="text-white font-medium">{selectedClient.name}</strong> · {selectedClient.email}
+                      <p className="text-xs text-[var(--text-secondary)] mt-0.5">
+                        Interlocuteur : <strong className="text-[var(--text-primary)] font-medium">{selectedClient.name}</strong> · {selectedClient.email}
                       </p>
                     </div>
                   </div>
@@ -557,9 +557,9 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
 
                 {/* 3. Four Synthesis Metric Cards */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                  <div className="p-3.5 rounded-2xl bg-white/[0.04] border border-white/10">
-                    <span className="text-[11px] text-[#8E97AB] block">Total facturé</span>
-                    <span className="text-lg font-bold text-white tabular-nums font-display mt-0.5 block">
+                  <div className="p-3.5 rounded-2xl bg-[var(--card-surface-elevated)] border border-[var(--border-subtle)]">
+                    <span className="text-[11px] text-[var(--text-secondary)] block">Total facturé</span>
+                    <span className="text-lg font-bold text-[var(--text-primary)] tabular-nums font-display mt-0.5 block">
                       {formatCurrency(totalInvoiced)}
                     </span>
                   </div>
@@ -578,10 +578,10 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
                     </span>
                   </div>
 
-                  <div className="p-3.5 rounded-2xl bg-white/[0.04] border border-white/10">
-                    <span className="text-[11px] text-[#8E97AB] block">Projets actifs</span>
-                    <span className="text-lg font-bold text-white tabular-nums font-display mt-0.5 block">
-                      {activeProjectsCount} <span className="text-xs font-normal text-[#8E97AB]">/ {clientProjects.length} total</span>
+                  <div className="p-3.5 rounded-2xl bg-[var(--card-surface-elevated)] border border-[var(--border-subtle)]">
+                    <span className="text-[11px] text-[var(--text-secondary)] block">Projets actifs</span>
+                    <span className="text-lg font-bold text-[var(--text-primary)] tabular-nums font-display mt-0.5 block">
+                      {activeProjectsCount} <span className="text-xs font-normal text-[var(--text-secondary)]">/ {clientProjects.length} total</span>
                     </span>
                   </div>
                 </div>

@@ -179,9 +179,9 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
 
   // Filter clients for dropdown search
   const filteredClients = clients.filter(c => 
-    c.company.toLowerCase().includes(clientSearch.toLowerCase()) ||
-    c.name.toLowerCase().includes(clientSearch.toLowerCase()) ||
-    c.email.toLowerCase().includes(clientSearch.toLowerCase())
+    (c.company || '').toLowerCase().includes(clientSearch.toLowerCase()) ||
+    (c.name || '').toLowerCase().includes(clientSearch.toLowerCase()) ||
+    (c.email || '').toLowerCase().includes(clientSearch.toLowerCase())
   );
 
   // Template prefill handler
@@ -1015,7 +1015,7 @@ export const CreateProjectModal: React.FC<CreateProjectModalProps> = ({
                   <div className="flex flex-wrap gap-1.5 mb-3">
                     {COLOR_SUGGESTIONS.map((sug) => (
                       <button
-                        key={sug.hex}
+                        key={`color-sug-${sug.hex}`}
                         type="button"
                         onClick={() => handleAddSuggestion(sug)}
                         className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/10 text-[11px] text-white/90 transition-colors cursor-pointer"

@@ -154,7 +154,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-[var(--text-primary)] font-display">
-            {profile?.name ? `Bonjour, ${profile.name.split(' ')[0]} 👋` : 'Bonjour 👋'}
+            {profile?.name ? `Bonjour, ${profile.name.split(' ')[0]} ` : 'Bonjour '}
           </h1>
           <p className="text-xs sm:text-sm text-[var(--text-secondary)] mt-1">
             Voici ce qui se passe sur vos projets créatifs aujourd'hui.

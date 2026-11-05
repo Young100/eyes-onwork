@@ -34,7 +34,8 @@ export const EmailVerificationGate: React.FC = () => {
   useEffect(() => {
     if (auth.email) {
       fetch(`/api/auth/verification-status?email=${encodeURIComponent(auth.email)}`)
-        .then(res => res.json())
+        .then(res => res.text())
+        .then(text => text ? JSON.parse(text) : null)
         .then(data => {
           if (data && typeof data.cooldownSeconds === 'number' && data.cooldownSeconds > 0) {
             setCooldown(data.cooldownSeconds);

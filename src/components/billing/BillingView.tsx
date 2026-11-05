@@ -366,7 +366,7 @@ export const BillingView: React.FC<BillingViewProps> = ({ onSelectProject, onSel
       {/* Top Banner & Main Actions */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-white font-display">
+          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-[var(--text-primary)] font-display">
             Facturation & Devis
           </h1>
           <p className="text-xs sm:text-sm text-[#8E97AB] mt-0.5">
@@ -415,7 +415,7 @@ export const BillingView: React.FC<BillingViewProps> = ({ onSelectProject, onSel
         <div className="glass-panel p-3.5 sm:p-4 flex flex-col justify-between">
           <span className="text-[11px] sm:text-xs font-medium text-[#8E97AB]">Devis engagés</span>
           <div className="my-1.5">
-            <span className="text-xl sm:text-2xl font-bold text-white font-display tabular-nums">
+            <span className="text-xl sm:text-2xl font-bold text-[var(--text-primary)] font-display tabular-nums">
               {formatCurrency(totalQuotesSent)}
             </span>
           </div>
@@ -427,7 +427,7 @@ export const BillingView: React.FC<BillingViewProps> = ({ onSelectProject, onSel
         <div className="glass-panel p-3.5 sm:p-4 flex flex-col justify-between">
           <span className="text-[11px] sm:text-xs font-medium text-[#8E97AB]">Total facturé TTC</span>
           <div className="my-1.5">
-            <span className="text-xl sm:text-2xl font-bold text-white font-display tabular-nums">
+            <span className="text-xl sm:text-2xl font-bold text-[var(--text-primary)] font-display tabular-nums">
               {formatCurrency(totalInvoicedTTC)}
             </span>
           </div>

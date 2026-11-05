@@ -37,7 +37,11 @@ export function formatMontant(
       minimumFractionDigits: 0,
       maximumFractionDigits: 0,
       useGrouping: true
-    }).format(num);
+    })
+      .format(num)
+      .replace(/[\u202F\u00A0\u2007\u2009]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
 
     return `${amount} FCFA`;
   }

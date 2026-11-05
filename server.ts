@@ -1,3 +1,936 @@
-var __defProp=Object.defineProperty;var __name=(target,value)=>__defProp(target,"name",{value,configurable:true});import express from"express";import dotenv from"dotenv";import path from"path";import{fileURLToPath}from"url";import{sendEmailSafe,buildClientConfirmationEmail,buildAdminNotificationEmail,buildPaymentReceiptEmail,buildTestEmail,buildVerificationCodeEmail,buildPasswordResetCodeEmail,issueVerificationCode,verifySubmittedCode,getVerificationStatus,checkEmailRateLimit,checkWorkspaceMonthlyLimit,getEmailLogs,getPlatformAdminEmail,getAdminEmail,getMailTransporter,getPlatformProviderConfig,formatSenderAddress}from"./emailService.js";import{getOrCreateUser,markEmailVerified,acceptTerms,completeOnboarding,updateUserProfile,registerUserWithPassword,verifyUserPassword,setUserPassword,issuePasswordResetCode,verifyPasswordResetCode,completePasswordResetWithCode,getUserByEmail}from"./src/server/userStore.js";import{runStorageHealthDiagnostic}from"./src/server/firestoreAdmin.js";dotenv.config();const __filename=fileURLToPath(import.meta.url);const __dirname=path.dirname(__filename);const app=express();const PORT=process.env.PORT||3e3;app.use(express.json({limit:"50mb"}));app.use(express.urlencoded({extended:true,limit:"50mb"}));app.use((req,res,next)=>{res.setHeader("X-Content-Type-Options","nosniff");res.removeHeader("X-Frame-Options");res.setHeader("X-XSS-Protection","1; mode=block");res.setHeader("Referrer-Policy","strict-origin-when-cross-origin");res.setHeader("Permissions-Policy","camera=(), microphone=(), geolocation=(), payment=*");const origin=req.headers.origin;if(origin){res.setHeader("Access-Control-Allow-Origin",origin);res.setHeader("Access-Control-Allow-Methods","GET, POST, PUT, DELETE, OPTIONS");res.setHeader("Access-Control-Allow-Headers","Content-Type, Authorization, X-Requested-With");res.setHeader("Access-Control-Allow-Credentials","true")}if(req.method==="OPTIONS"){return res.sendStatus(204)}next()});const serverErrorLogs=[];const paymentTransactions=[];const publicLeadIpLimits=new Map;const clientPortalIpLimits=new Map;function logInternalError(message,source="server",details){const entry={id:`err_${Date.now()}_${Math.random().toString(36).slice(2,6)}`,timestamp:new Date().toISOString(),source,message:String(message),stack:details?.stack,path:details?.path,ip:details?.ip};serverErrorLogs.unshift(entry);if(serverErrorLogs.length>100){serverErrorLogs.pop()}}__name(logInternalError,"logInternalError");app.post("/api/public/lead",async(req,res)=>{const{hp_field,name,email,company,phone,projectType,description,estimatedBudget,desiredDeadline}=req.body;if(hp_field){console.warn("[Anti-Spam] Honeypot triggered, silently ignoring submission");return res.status(200).json({success:true,message:"Demande re\xE7ue"})}const clientIp=req.headers["x-forwarded-for"]||req.socket.remoteAddress||"unknown";const now=Date.now();const rateLimit=publicLeadIpLimits.get(clientIp);if(rateLimit){if(now<rateLimit.resetAt){if(rateLimit.count>=5){return res.status(429).json({error:"Trop de demandes envoy\xE9es. Veuillez patienter quelques minutes."})}rateLimit.count++}else{publicLeadIpLimits.set(clientIp,{count:1,resetAt:now+10*60*1e3})}}else{publicLeadIpLimits.set(clientIp,{count:1,resetAt:now+10*60*1e3})}if(!name||!email||!description){return res.status(400).json({error:"Champs obligatoires manquants (nom, email, description)."})}const leadId=`lead_${Date.now()}`;console.log(`[Public Lead] New lead received from ${name} (${company||"Ind\xE9pendant"} - ${email})`);const adminEmail=getAdminEmail();const adminEmailContent=buildAdminNotificationEmail({clientName:name,clientEmail:email,clientPhone:phone,clientCompany:company,projectType:projectType||"Cr\xE9ation graphique",projectTitle:`Demande de ${company||name}`,description,estimatedBudget,desiredDeadline,orderNumber:leadId,adminUrl:`${req.protocol}://${req.get("host")}/`});sendEmailSafe({to:adminEmail,subject:adminEmailContent.subject,html:adminEmailContent.html,text:adminEmailContent.text,templateKey:"notification_admin",recipientName:"Studio (Admin)",ip:clientIp}).catch(err=>console.warn("[Email Warning] Failed to notify admin:",err.message));const clientAckEmail=buildClientConfirmationEmail({clientName:name,orderNumber:leadId,projectTitle:`Votre demande de cr\xE9ation (${projectType||"Design graphique"})`,items:[{description:`\xC9tude pr\xE9liminaire & cadrage : ${description.slice(0,80)}...`,quantity:1,unitPrice:0,total:0}],totalHT:0,totalTTC:0,notes:"Nous avons bien re\xE7u vos sp\xE9cifications. Un devis et une proposition de calendrier vous seront transmis sous 24 \xE0 48 heures."});sendEmailSafe({to:email,subject:`Accus\xE9 de r\xE9ception de votre demande \u2014 Studio Graphique`,html:clientAckEmail.html,text:clientAckEmail.text,templateKey:"confirmation_client",recipientName:name,ip:clientIp}).catch(err=>console.warn("[Email Warning] Failed to send client ack:",err.message));return res.status(200).json({success:true,leadId,message:"Votre demande a \xE9t\xE9 transmise avec succ\xE8s au studio. Un email de confirmation vous a \xE9t\xE9 envoy\xE9."})});function isSuperAdminRequest(req){const adminEmail=(process.env.ADMIN_EMAIL||"").trim().toLowerCase();const callerEmail=(req.headers["x-admin-email"]||req.headers["x-user-email"])?.trim().toLowerCase();const adminKey=req.headers["x-admin-key"]?.trim();const recognizedSuperAdmins=new Set(["ouattaraabdoulaye479@gmail.com","abdoulayegraphic@gmail.com",...adminEmail?[adminEmail]:[]]);if(callerEmail&&recognizedSuperAdmins.has(callerEmail)){return true}if(process.env.ADMIN_SECRET&&adminKey&&adminKey===process.env.ADMIN_SECRET){return true}return false}__name(isSuperAdminRequest,"isSuperAdminRequest");app.get("/api/admin/email/status",(req,res)=>{if(!isSuperAdminRequest(req)){return res.status(403).json({error:"Acc\xE8s r\xE9serv\xE9 au Super Administrateur de la plateforme."})}const config=getPlatformProviderConfig();return res.status(200).json(config)});app.get("/api/admin/email/logs",(req,res)=>{if(!isSuperAdminRequest(req)){return res.status(403).json({error:"Acc\xE8s r\xE9serv\xE9 au Super Administrateur de la plateforme."})}return res.status(200).json({logs:getEmailLogs(),adminAlertEmail:getPlatformAdminEmail()})});app.post("/api/admin/email/test",async(req,res)=>{if(!isSuperAdminRequest(req)){return res.status(403).json({error:"Acc\xE8s r\xE9serv\xE9 au Super Administrateur de la plateforme."})}const clientIp=req.headers["x-forwarded-for"]||req.socket.remoteAddress||"unknown";const targetEmail=req.body?.to||getPlatformAdminEmail();const testContent=buildTestEmail({recipientEmail:targetEmail,isPlatformTest:true});try{const result=await sendEmailSafe({to:targetEmail,subject:testContent.subject,html:testContent.html,text:testContent.text,templateKey:"test_platform",recipientName:"Super Administrateur",studioName:"eyes-onwork Plateforme",workspaceId:"platform_system",ip:clientIp});return res.status(200).json({success:result.success,mode:result.mode,targetEmail,messageId:result.messageId,error:result.error,log:result.log,note:result.mode==="live"?`Email de test plateforme transmis \xE0 ${targetEmail}.`:`Mode simulation actif : GMAIL_USER / GMAIL_APP_PASSWORD non configur\xE9s.`})}catch(err){return res.status(200).json({success:false,error:err.message||"\xC9chec de transmission plateforme"})}});app.get("/api/admin/storage/health",async(req,res)=>{if(!isSuperAdminRequest(req)){return res.status(403).json({error:"Acc\xE8s r\xE9serv\xE9 au Super Administrateur de la plateforme."})}try{const health=await runStorageHealthDiagnostic();return res.status(200).json(health)}catch(err){return res.status(500).json({connected:false,error:err.message||"\xC9chec du diagnostic de stockage"})}});app.post("/api/email/test",async(req,res)=>{const clientIp=req.headers["x-forwarded-for"]||req.socket.remoteAddress||"unknown";const rateCheck=checkEmailRateLimit(clientIp,5);if(!rateCheck.allowed){return res.status(429).json({success:false,error:"Limite de s\xE9curit\xE9 atteinte : maximum 5 tests par minute."})}const{to,studioName,replyTo,workspaceId="ws_freelance"}=req.body;if(!to){return res.status(400).json({error:"Adresse email de notification requise."})}const testContent=buildTestEmail({recipientEmail:to,studioName,isPlatformTest:false});try{const result=await sendEmailSafe({to,subject:testContent.subject,html:testContent.html,text:testContent.text,templateKey:"test_workspace",recipientName:studioName||"Freelance",studioName,replyTo,workspaceId,ip:clientIp});return res.status(200).json({success:result.success,mode:result.mode,targetEmail:to,messageId:result.messageId,error:result.error,log:result.log,note:result.mode==="live"?`Email de test envoy\xE9 avec succ\xE8s \xE0 votre adresse ${to}.`:`Email enregistr\xE9 en simulation (serveur de test sans SMTP).`})}catch(err){return res.status(200).json({success:false,error:err.message||"\xC9chec de transmission de l\u2019email"})}});app.get("/api/email/logs",(req,res)=>{const workspaceId=req.query.workspaceId||"";if(!workspaceId){return res.status(200).json({logs:[]})}const logs=getEmailLogs(workspaceId);return res.status(200).json({logs})});app.post("/api/auth/send-verification-code",async(req,res)=>{const clientIp=req.headers["x-forwarded-for"]||req.socket.remoteAddress||"unknown";const{email,userId,studioName}=req.body;if(!email||typeof email!=="string"||!email.includes("@")){return res.status(400).json({success:false,error:"INVALID_EMAIL",message:"Adresse email valide requise."})}const cleanEmail=email.trim().toLowerCase();const issueResult=issueVerificationCode(cleanEmail,userId);if(!issueResult.success){return res.status(429).json({success:false,error:issueResult.error,remainingSeconds:issueResult.remainingSeconds,message:issueResult.message})}const code=issueResult.code;const emailContent=buildVerificationCodeEmail({code,recipientEmail:cleanEmail,studioName:studioName||"eyes-onwork",expirationMinutes:10});const sendResult=await sendEmailSafe({to:cleanEmail,subject:emailContent.subject,html:emailContent.html,text:emailContent.text,templateKey:"verification_code",recipientName:cleanEmail,studioName:studioName||"eyes-onwork",workspaceId:"auth_verification",ip:clientIp});if(!sendResult.success){console.error(`[Auth Email Error] Failed to send verification code to ${cleanEmail}: ${sendResult.error}`);const adminAlert=buildAdminNotificationEmail({clientName:"Syst\xE8me Auth",clientEmail:cleanEmail,projectType:"Alerte Envoi Email V\xE9rification",projectTitle:"\xC9chec d\u2019envoi de code de v\xE9rification",description:`L'envoi du code \xE0 l'adresse ${cleanEmail} a \xE9chou\xE9. Cause: ${sendResult.error||"Erreur SMTP"}.`,adminUrl:`${req.protocol}://${req.get("host")}/`});sendEmailSafe({to:getPlatformAdminEmail(),subject:adminAlert.subject,html:adminAlert.html,text:adminAlert.text,templateKey:"notification_admin",recipientName:"Super Admin",ip:clientIp}).catch(()=>{});return res.status(500).json({success:false,error:"SEND_FAILED",message:"Nous n'avons pas pu envoyer l'email, r\xE9essayez dans un instant."})}return res.status(200).json({success:true,message:"Code de v\xE9rification envoy\xE9 avec succ\xE8s.",expiresAt:issueResult.expiresAt,cooldownSeconds:60,mode:sendResult.mode})});app.post("/api/auth/verify-code",(req,res)=>{const{email,code}=req.body;if(!email||!code){return res.status(400).json({success:false,error:"MISSING_FIELDS",message:"Email et code requis."})}const verifyResult=verifySubmittedCode(email,code);if(!verifyResult.success){return res.status(400).json(verifyResult)}const updatedUser=markEmailVerified(email);return res.status(200).json({success:true,verified:true,emailVerifiedAt:updatedUser.emailVerifiedAt,profile:updatedUser,message:"Votre adresse email a \xE9t\xE9 v\xE9rifi\xE9e avec succ\xE8s."})});app.post("/api/auth/login-sync",(req,res)=>{const{email,provider,displayName,name}=req.body;if(!email||typeof email!=="string"||!email.includes("@")){return res.status(400).json({success:false,error:"INVALID_EMAIL",message:"Email valide requis."})}const user=getOrCreateUser(email,{provider:provider==="google"?"google":"password",displayName:displayName||name});return res.status(200).json({success:true,profile:user})});app.post("/api/auth/register-user",async(req,res)=>{const clientIp=req.headers["x-forwarded-for"]||req.socket.remoteAddress||"unknown";const{email,password,displayName,studioName}=req.body;if(!email||!password){return res.status(400).json({success:false,error:"Email et mot de passe requis."})}const regResult=registerUserWithPassword(email,password,displayName,studioName);if(!regResult.success){return res.status(400).json(regResult)}const cleanEmail=email.trim().toLowerCase();const issueResult=issueVerificationCode(cleanEmail,regResult.user?.uid);if(issueResult.success&&issueResult.code){const emailContent=buildVerificationCodeEmail({code:issueResult.code,recipientEmail:cleanEmail,studioName:studioName||"eyes-onwork",expirationMinutes:10});sendEmailSafe({to:cleanEmail,subject:emailContent.subject,html:emailContent.html,text:emailContent.text,templateKey:"verification_code",recipientName:cleanEmail,studioName:studioName||"eyes-onwork",workspaceId:"auth_verification",ip:clientIp}).catch(()=>{})}return res.status(200).json({success:true,profile:regResult.user,message:"Compte créé avec succès."})});app.post("/api/auth/login",(req,res)=>{const{email,password}=req.body;if(!email||!password){return res.status(400).json({success:false,error:"Email et mot de passe requis."})}const authResult=verifyUserPassword(email,password);if(!authResult.valid){return res.status(401).json({success:false,error:authResult.error||"Identifiants incorrects."})}return res.status(200).json({success:true,profile:authResult.user,message:"Connexion réussie."})});app.post("/api/auth/send-reset-code",async(req,res)=>{const clientIp=req.headers["x-forwarded-for"]||req.socket.remoteAddress||"unknown";const{email,studioName}=req.body;if(!email||typeof email!=="string"||!email.includes("@")){return res.status(400).json({success:false,error:"INVALID_EMAIL",message:"Adresse email valide requise."})}const cleanEmail=email.trim().toLowerCase();const issueResult=issuePasswordResetCode(cleanEmail);if(!issueResult.success){return res.status(429).json({success:false,error:issueResult.error,remainingSeconds:issueResult.remainingSeconds,message:issueResult.error==="COOLDOWN"?`Veuillez patienter ${issueResult.remainingSeconds}s avant de redemander un code.`:"Trop de demandes."})}const code=issueResult.code;if(code){const emailContent=buildPasswordResetCodeEmail({code,recipientEmail:cleanEmail,studioName:studioName||"eyes-onwork",expirationMinutes:15});const sendResult=await sendEmailSafe({to:cleanEmail,subject:emailContent.subject,html:emailContent.html,text:emailContent.text,templateKey:"password_reset",recipientName:cleanEmail,studioName:studioName||"eyes-onwork",workspaceId:"auth_reset",ip:clientIp});console.log(`[Password Reset] Dispatched reset code to ${cleanEmail} (mode: ${sendResult.mode})`)}return res.status(200).json({success:true,message:"Code de réinitialisation transmis à votre adresse email.",expiresAt:issueResult.expiresAt,cooldownSeconds:60})});app.post("/api/auth/verify-reset-code",(req,res)=>{const{email,code}=req.body;if(!email||!code){return res.status(400).json({success:false,error:"MISSING_FIELDS",message:"Email et code requis."})}const result=verifyPasswordResetCode(email,code);if(!result.valid){return res.status(400).json({success:false,error:result.error,remainingAttempts:result.remainingAttempts})}return res.status(200).json({success:true,message:"Code vérifié avec succès."})});app.post("/api/auth/reset-password",(req,res)=>{const{email,code,newPassword}=req.body;if(!email||!code||!newPassword){return res.status(400).json({success:false,error:"MISSING_FIELDS",message:"Email, code et nouveau mot de passe requis."})}const result=completePasswordResetWithCode(email,code,newPassword);if(!result.success){return res.status(400).json({success:false,error:result.error})}return res.status(200).json({success:true,profile:result.user,message:"Votre mot de passe a été réinitialisé avec succès."})});app.get("/api/user/profile",(req,res)=>{const email=req.query.email||req.headers["x-user-email"];if(!email){return res.status(400).json({success:false,error:"EMAIL_REQUIRED",message:"Email requis."})}const user=getOrCreateUser(email);return res.status(200).json({success:true,profile:user})});app.post("/api/user/profile",(req,res)=>{const{email,...updates}=req.body;if(!email){return res.status(400).json({success:false,error:"EMAIL_REQUIRED",message:"Email requis."})}const updated=updateUserProfile(email,updates);return res.status(200).json({success:true,profile:updated})});app.post("/api/auth/accept-terms",(req,res)=>{const{email,termsVersion,privacyVersion}=req.body;if(!email){return res.status(400).json({success:false,error:"EMAIL_REQUIRED",message:"Email requis."})}try{const updated=acceptTerms(email,termsVersion||"2026.1",privacyVersion||"2026.1");return res.status(200).json({success:true,profile:updated,message:"Conditions d\u2019utilisation enregistr\xE9es avec succ\xE8s."})}catch(err){return res.status(500).json({success:false,error:"PERSISTENCE_FAILED",message:"\xC9chec de l\u2019enregistrement de votre acceptation sur le serveur."})}});app.post("/api/auth/complete-onboarding",(req,res)=>{const{email,step}=req.body;if(!email){return res.status(400).json({success:false,error:"EMAIL_REQUIRED",message:"Email requis."})}try{const updated=completeOnboarding(email,step||5);return res.status(200).json({success:true,profile:updated,message:"Configuration initiale valid\xE9e avec succ\xE8s."})}catch(err){return res.status(500).json({success:false,error:"PERSISTENCE_FAILED",message:"\xC9chec de validation de la configuration sur le serveur."})}});app.get("/api/auth/verification-status",(req,res)=>{const email=req.query.email||"";if(!email){return res.status(400).json({error:"Email requis"})}const status=getVerificationStatus(email);return res.status(200).json(status)});app.post("/api/email/send-confirmation",async(req,res)=>{const clientIp=req.headers["x-forwarded-for"]||req.socket.remoteAddress||"unknown";const rateCheck=checkEmailRateLimit(clientIp,10);if(!rateCheck.allowed){return res.status(429).json({success:false,error:"Trop d\u2019emails envoy\xE9s en peu de temps. Veuillez patienter."})}const{to,clientName,orderNumber,projectTitle,items=[],totalHT=0,vatRate,totalTTC=0,depositAmount,balanceDue,trackingUrl,notes,workspaceId="ws_default",studioName,replyTo}=req.body;if(!to||!clientName){return res.status(400).json({error:"Destinataire (to) et nom du client (clientName) requis"})}const quotaCheck=checkWorkspaceMonthlyLimit(workspaceId,30);if(!quotaCheck.allowed){return res.status(403).json({success:false,error:`Plafond mensuel d\u2019envois d\u2019emails atteint (${quotaCheck.currentCount}/${quotaCheck.maxAllowed}). Passez au plan Pro pour un quota illimit\xE9.`})}const rawItems=Array.isArray(items)?items:[];const safeItems=rawItems.length>0?rawItems:[{description:"Prestation cr\xE9ative sur mesure",quantity:1,unitPrice:Number(totalHT),total:Number(totalHT)}];const emailData=buildClientConfirmationEmail({clientName,orderNumber:orderNumber||`CMD-${Date.now().toString().slice(-6)}`,projectTitle:projectTitle||"Prestations Graphiques",items:safeItems,totalHT:Number(totalHT),vatRate:vatRate!==void 0?Number(vatRate):void 0,totalTTC:Number(totalTTC||totalHT),depositAmount:depositAmount!==void 0?Number(depositAmount):void 0,balanceDue:balanceDue!==void 0?Number(balanceDue):void 0,trackingUrl,notes,studioName,replyTo});const sendResult=await sendEmailSafe({to,subject:emailData.subject,html:emailData.html,text:emailData.text,templateKey:"confirmation_client",recipientName:clientName,studioName,replyTo,workspaceId,ip:clientIp});const targetAlertEmail=replyTo||getPlatformAdminEmail();const alertNotify=buildAdminNotificationEmail({clientName,clientEmail:to,projectType:"Validation de commande",projectTitle:projectTitle||"Nouvelle commande valid\xE9e",description:`Commande ${orderNumber||""} valid\xE9e d\u2019un montant de ${Number(totalTTC||totalHT).toLocaleString("fr-FR")} \u20AC TTC.`,orderNumber:orderNumber||`CMD-${Date.now().toString().slice(-6)}`,adminUrl:`${req.protocol}://${req.get("host")}/`,studioName,replyTo});sendEmailSafe({to:targetAlertEmail,subject:alertNotify.subject,html:alertNotify.html,text:alertNotify.text,templateKey:"notification_admin",recipientName:studioName||"Freelance",studioName,replyTo,workspaceId,ip:clientIp}).catch(()=>{});return res.status(200).json(sendResult)});app.post("/api/email/send-admin-notification",async(req,res)=>{const clientIp=req.headers["x-forwarded-for"]||req.socket.remoteAddress||"unknown";const rateCheck=checkEmailRateLimit(clientIp,10);if(!rateCheck.allowed){return res.status(429).json({success:false,error:"Trop d\u2019emails envoy\xE9s en peu de temps. Veuillez patienter."})}const{to,clientName,clientEmail,clientPhone,clientCompany,projectType="Cr\xE9ation graphique",projectTitle="Nouveau projet client",description="Sp\xE9cifications du projet transmises par le client.",estimatedBudget,desiredDeadline,orderNumber,adminUrl,workspaceId="ws_default",studioName,replyTo}=req.body;const targetNotificationEmail=to||replyTo||getPlatformAdminEmail();const emailData=buildAdminNotificationEmail({clientName:clientName||"Client studio",clientEmail:clientEmail||"client@studio.fr",clientPhone,clientCompany,projectType,projectTitle,description,estimatedBudget,desiredDeadline,orderNumber:orderNumber||`TKT-${Date.now().toString().slice(-6)}`,adminUrl:adminUrl||`${req.protocol}://${req.get("host")}/`,studioName,replyTo});const sendResult=await sendEmailSafe({to:targetNotificationEmail,subject:emailData.subject,html:emailData.html,text:emailData.text,templateKey:"notification_admin",recipientName:studioName||"Freelance",studioName,replyTo,workspaceId,ip:clientIp});return res.status(200).json(sendResult)});app.post("/api/email/send-receipt",async(req,res)=>{const clientIp=req.headers["x-forwarded-for"]||req.socket.remoteAddress||"unknown";const rateCheck=checkEmailRateLimit(clientIp,10);if(!rateCheck.allowed){return res.status(429).json({success:false,error:"Trop d\u2019emails envoy\xE9s en peu de temps. Veuillez patienter."})}const{to,clientName,invoiceNumber,projectTitle,amountPaid,totalInvoiceTTC,balanceRemaining,paymentMethod="Virement bancaire",paymentDate,downloadUrl,isFullPayment=false,workspaceId="ws_default",studioName,replyTo}=req.body;if(!to||!clientName||amountPaid===void 0){return res.status(400).json({error:"Destinataire (to), nom (clientName) et montant (amountPaid) requis"})}const emailData=buildPaymentReceiptEmail({clientName,invoiceNumber:invoiceNumber||"FAC-2026-001",projectTitle:projectTitle||"Prestations Graphiques",amountPaid:Number(amountPaid),totalInvoiceTTC:Number(totalInvoiceTTC||amountPaid),balanceRemaining:Number(balanceRemaining||0),paymentMethod,paymentDate:paymentDate||new Date().toLocaleDateString("fr-FR"),downloadUrl,isFullPayment:Boolean(isFullPayment||balanceRemaining<=0),studioName,replyTo});const sendResult=await sendEmailSafe({to,subject:emailData.subject,html:emailData.html,text:emailData.text,templateKey:"recu_facture",recipientName:clientName,studioName,replyTo,workspaceId,ip:clientIp});return res.status(200).json(sendResult)});app.post("/api/email/send",async(req,res)=>{const clientIp=req.headers["x-forwarded-for"]||req.socket.remoteAddress||"unknown";const rateCheck=checkEmailRateLimit(clientIp,10);if(!rateCheck.allowed){return res.status(429).json({success:false,error:"Trop d\u2019emails envoy\xE9s en peu de temps."})}const{to,subject,html,text,templateKey="custom",recipientName,workspaceId="ws_default",studioName,replyTo}=req.body;if(!to||!subject){return res.status(400).json({error:"Destinataire (to) et sujet (subject) requis"})}const result=await sendEmailSafe({to,subject,html:html||`<p>${text||subject}</p>`,text:text||"",templateKey,recipientName,studioName,replyTo,workspaceId,ip:clientIp});return res.status(200).json(result)});app.post("/api/telegram/notify",async(req,res)=>{const{message}=req.body;const botToken=process.env.TELEGRAM_BOT_TOKEN;const chatId=process.env.TELEGRAM_CHAT_ID;if(!botToken||!chatId){return res.status(200).json({success:true,mode:"skipped",note:"Telegram non configur\xE9"})}try{const url=`https://api.telegram.org/bot${botToken}/sendMessage`;const resp=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({chat_id:chatId,text:message,parse_mode:"HTML"})});if(!resp.ok){throw new Error(`Telegram error: ${resp.status}`)}return res.status(200).json({success:true,mode:"live"})}catch(err){console.warn("[Telegram notification warning]:",err.message);return res.status(200).json({success:false,error:err.message})}});app.post("/api/payment/create-session",(req,res)=>{const{invoiceId,amount,currency,customerEmail,invoiceNumber}=req.body;const sessionId=`sess_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;return res.status(200).json({success:true,provider:"test",sessionId,paymentData:{invoiceId,invoiceNumber,amount,currency:currency||"EUR",customerEmail}})});app.post("/api/payment/webhook",async(req,res)=>{const{event,invoiceId,amount,transactionRef,signature,customerEmail,clientName,invoiceNumber,projectTitle}=req.body;const validSignature=signature||"valid_test_sig";if(!validSignature){return res.status(400).json({error:"Signature webhook invalide"})}const tx={id:`tx_${Date.now()}`,invoiceId,amount:Number(amount),transactionRef:transactionRef||`REF-${Date.now()}`,status:"succeeded",date:new Date().toISOString()};paymentTransactions.unshift(tx);console.log(`[Payment Webhook] Confirmed payment for invoice ${invoiceId}: ${amount} \u20AC`);if(customerEmail){const receiptData=buildPaymentReceiptEmail({clientName:clientName||"Client",invoiceNumber:invoiceNumber||"FAC-2026",receiptNumber:tx.transactionRef,projectTitle:projectTitle||"Prestations de Design Graphique",amountPaid:Number(amount),totalInvoiceTTC:Number(amount),balanceRemaining:0,paymentMethod:"Paiement en ligne s\xE9curis\xE9",paymentDate:new Date().toLocaleDateString("fr-FR"),isFullPayment:true});sendEmailSafe({to:customerEmail,subject:receiptData.subject,html:receiptData.html,text:receiptData.text,templateKey:"recu_facture",recipientName:clientName}).catch(err=>console.warn("[Payment Webhook] Failed to send receipt email:",err.message))}return res.status(200).json({received:true,transaction:tx})});const FORBIDDEN_SERVER_EXT=new Set(["exe","bat","cmd","sh","php","phtml","py","js","mjs","vbs","jar","bin","msi","com","scr","dll","reg","hta","html","htm"]);app.post("/api/upload",(req,res)=>{const{fileName,size,contentType,dataUrl}=req.body;if(!fileName||typeof fileName!=="string"){return res.status(400).json({success:false,error:"Nom de fichier manquant ou invalide."})}const maxBytes=50*1024*1024;const fileSize=Number(size)||0;if(fileSize>maxBytes){return res.status(413).json({success:false,error:`Fichier trop volumineux. La limite maximale est de 50 Mo (re\xE7u : ${(fileSize/(1024*1024)).toFixed(1)} Mo).`})}const ext=fileName.split(".").pop()?.toLowerCase()||"";if(FORBIDDEN_SERVER_EXT.has(ext)){logInternalError(`Tentative de t\xE9l\xE9versement de fichier interdit: ${fileName}`,"client",{ip:req.ip});return res.status(403).json({success:false,error:`Format de fichier strictement refus\xE9 (.${ext}). Les fichiers ex\xE9cutables et scripts ne sont pas autoris\xE9s.`})}const baseName=fileName.split(/[/\\]/).pop()||"fichier";const cleanName=baseName.normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/[^a-zA-Z0-9._-]/g,"_").slice(0,100);const finalName=`${Date.now()}_${cleanName}`;console.log(`[Upload S\xE9curis\xE9] Fichier valid\xE9 : ${finalName} (${(fileSize/1024).toFixed(0)} Ko)`);return res.status(200).json({success:true,file:{originalName:fileName,sanitizedName:finalName,size:fileSize,contentType:contentType||"application/octet-stream",url:dataUrl||`/uploads/${finalName}`,uploadedAt:new Date().toISOString()}})});app.get("/api/system/health",(req,res)=>{const mem=process.memoryUsage();return res.status(200).json({status:"healthy",uptimeSeconds:Math.floor(process.uptime()),environment:process.env.NODE_ENV||"development",serverTime:new Date().toISOString(),smtp:{configured:Boolean(getMailTransporter()),sender:formatSenderAddress("Studio"),adminEmail:getAdminEmail()},security:{securityHeaders:true,rateLimitingActive:true,xssSanitizationActive:true,corsRestricted:true,maxUploadSizeMb:50},memory:{rssMb:(mem.rss/(1024*1024)).toFixed(1),heapUsedMb:(mem.heapUsed/(1024*1024)).toFixed(1)},recentErrorsCount:serverErrorLogs.length})});app.get("/api/system/errors",(req,res)=>{return res.status(200).json({errors:serverErrorLogs.slice(0,50)})});app.post("/api/system/log-error",(req,res)=>{const{message,stack,path:errPath}=req.body;const clientIp=req.headers["x-forwarded-for"]||req.socket.remoteAddress||"unknown";if(message){logInternalError(message,"client",{stack,path:errPath,ip:clientIp})}return res.status(200).json({received:true})});async function startServer(){if(process.env.NODE_ENV==="production"){app.use(express.static(path.join(__dirname,"dist")));app.get("*",(req,res)=>{res.sendFile(path.join(__dirname,"dist","index.html"))})}else{const{createServer:createViteServer}=await import("vite").then(s=>{const e="default";return s[e]&&typeof s[e]=="object"&&"__esModule"in s[e]?s[e]:s});const vite=await createViteServer({server:{middlewareMode:true,hmr:false,ws:false},appType:"spa"});app.use(vite.middlewares)}const serverInstance=app.listen(Number(PORT),"0.0.0.0",()=>{console.log(`[eyes-onwork] Server running on port ${PORT}`);console.log(`[SMTP Gmail] Sender: ${formatSenderAddress("Studio")}`);console.log(`[SMTP Gmail] Admin notification email: ${getAdminEmail()}`)});serverInstance.on("error",(err)=>{if(err&&err.code==="EADDRINUSE"){console.warn(`[eyes-onwork] Port ${PORT} is already in use by active listener. Continuing without crash.`);}else{console.error("[eyes-onwork] Server error:",err);}})}__name(startServer,"startServer");startServer();
+import express, { Request, Response, NextFunction } from 'express';
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import {
+  sendEmailSafe,
+  buildClientConfirmationEmail,
+  buildAdminNotificationEmail,
+  buildPaymentReceiptEmail,
+  buildTestEmail,
+  buildVerificationCodeEmail,
+  issueVerificationCode,
+  verifySubmittedCode,
+  getVerificationStatus,
+  checkEmailRateLimit,
+  checkWorkspaceMonthlyLimit,
+  getEmailLogs,
+  getPlatformAdminEmail,
+  getAdminEmail,
+  getMailTransporter,
+  getPlatformProviderConfig,
+  formatSenderAddress
+} from './emailService.js';
+import {
+  verifyFirebaseToken,
+  setSuperAdminClaim,
+  markUserEmailVerifiedInAuth,
+  getServerUserProfile,
+  setServerUserProfile,
+  getClientPortalDataByToken,
+  getSuperAdminUids,
+  testFirestoreAdminConnection,
+  getStartupFirestoreTestResult,
+  adminDb
+} from './src/server/firebaseAdminSdk.js';
+import { runStorageHealthDiagnostic } from './src/server/firestoreAdmin.js';
 
-//# sourceMappingURL=data:application/json;base64,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WSxRQUFRLG1CQUFtQixDQUFDLEVBQ3hDLE9BQVEsb0JBQW9CLFFBQVEsRUFDcEMsV0FBWSxjQUFjLENBQzVCLEVBQ0EsU0FBVSxDQUNSLGdCQUFpQixLQUNqQixtQkFBb0IsS0FDcEIsc0JBQXVCLEtBQ3ZCLGVBQWdCLEtBQ2hCLGdCQUFpQixFQUNuQixFQUNBLE9BQVEsQ0FDTixPQUFRLElBQUksS0FBTyxLQUFPLE9BQU8sUUFBUSxDQUFDLEVBQzFDLFlBQWEsSUFBSSxVQUFZLEtBQU8sT0FBTyxRQUFRLENBQUMsQ0FDdEQsRUFDQSxrQkFBbUIsZ0JBQWdCLE1BQ3JDLENBQUMsQ0FDSCxDQUFDLEVBR0QsSUFBSSxJQUFJLHFCQUFzQixDQUFDLElBQUssTUFBUSxDQUMxQyxPQUFPLElBQUksT0FBTyxHQUFHLEVBQUUsS0FBSyxDQUMxQixPQUFRLGdCQUFnQixNQUFNLEVBQUcsRUFBRSxDQUNyQyxDQUFDLENBQ0gsQ0FBQyxFQUdELElBQUksS0FBSyx3QkFBeUIsQ0FBQyxJQUFLLE1BQVEsQ0FDOUMsS0FBTSxDQUFFLFFBQVMsTUFBTyxLQUFNLE9BQVEsRUFBSSxJQUFJLEtBQzlDLE1BQU0sU0FBWSxJQUFJLFFBQVEsaUJBQWlCLEdBQWdCLElBQUksT0FBTyxlQUFpQixVQUUzRixHQUFJLFFBQVMsQ0FDWCxpQkFBaUIsUUFBUyxTQUFVLENBQ2xDLE1BQ0EsS0FBTSxRQUNOLEdBQUksUUFDTixDQUFDLENBQ0gsQ0FFQSxPQUFPLElBQUksT0FBTyxHQUFHLEVBQUUsS0FBSyxDQUFFLFNBQVUsSUFBSyxDQUFDLENBQ2hELENBQUMsRUFLRCxlQUFlLGFBQWMsQ0FDM0IsR0FBSSxRQUFRLElBQUksV0FBYSxhQUFjLENBQ3pDLElBQUksSUFBSSxRQUFRLE9BQU8sS0FBSyxLQUFLLFVBQVcsTUFBTSxDQUFDLENBQUMsRUFDcEQsSUFBSSxJQUFJLElBQUssQ0FBQyxJQUFLLE1BQVEsQ0FDekIsSUFBSSxTQUFTLEtBQUssS0FBSyxVQUFXLE9BQVEsWUFBWSxDQUFDLENBQ3pELENBQUMsQ0FDSCxLQUFPLENBRUwsS0FBTSxDQUFFLGFBQWMsZ0JBQWlCLEVBQUksS0FBTSxRQUFPLE1BQU0sOEZBQzlELE1BQU0sS0FBTyxNQUFNLGlCQUFpQixDQUNsQyxPQUFRLENBQUUsZUFBZ0IsSUFBSyxFQUMvQixRQUFTLEtBQ1gsQ0FBQyxFQUNELElBQUksSUFBSSxLQUFLLFdBQVcsQ0FDMUIsQ0FFQSxJQUFJLE9BQU8sT0FBTyxJQUFJLEVBQUcsVUFBVyxJQUFNLENBQ3hDLFFBQVEsSUFBSSx3Q0FBd0MsSUFBSSxFQUFFLEVBQzFELFFBQVEsSUFBSSx3QkFBd0Isb0JBQW9CLFFBQVEsQ0FBQyxFQUFFLEVBQ25FLFFBQVEsSUFBSSwwQ0FBMEMsY0FBYyxDQUFDLEVBQUUsQ0FDekUsQ0FBQyxDQUNILENBckJlLGtDQXVCZixZQUFZIiwibmFtZXMiOltdLCJpZ25vcmVMaXN0IjpbXSwic291cmNlcyI6WyIvYXBwL2FwcGxldC9zZXJ2ZXIudHMiXSwic291cmNlc0NvbnRlbnQiOltudWxsXX0=
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// SÉCURITÉ : En-têtes HTTP défensifs
+app.use((req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.removeHeader('X-Frame-Options');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=*');
+
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
+// Logs internes du serveur
+const serverErrorLogs: Array<{
+  id: string;
+  timestamp: string;
+  source: string;
+  message: string;
+  stack?: string;
+  path?: string;
+  ip?: string;
+}> = [];
+
+function logInternalError(message: string, source: string = 'server', details?: any) {
+  const entry = {
+    id: `err_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    timestamp: new Date().toISOString(),
+    source,
+    message: String(message),
+    stack: details?.stack,
+    path: details?.path,
+    ip: details?.ip
+  };
+  serverErrorLogs.unshift(entry);
+  if (serverErrorLogs.length > 100) serverErrorLogs.pop();
+}
+
+// Rate limiters en mémoire
+const publicLeadIpLimits = new Map<string, { count: number; resetAt: number }>();
+const portalIpLimits = new Map<string, { count: number; resetAt: number }>();
+const authRateLimits = new Map<string, { count: number; resetAt: number }>();
+
+function checkRateLimit(map: Map<string, { count: number; resetAt: number }>, ip: string, maxCount: number, windowMs: number): boolean {
+  const now = Date.now();
+  const current = map.get(ip);
+  if (!current || now >= current.resetAt) {
+    map.set(ip, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+  if (current.count >= maxCount) {
+    return false;
+  }
+  current.count++;
+  return true;
+}
+
+// Middleware d'authentification Firebase Admin SDK
+export interface AuthenticatedRequest extends Request {
+  user?: {
+    uid: string;
+    email?: string;
+    emailVerified?: boolean;
+    role?: string;
+    isSuperAdmin?: boolean;
+    rawToken: any;
+  };
+}
+
+async function requireFirebaseAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({
+      success: false,
+      error: 'UNAUTHORIZED',
+      message: 'Authentification requise. Jeton Bearer manquant.'
+    });
+  }
+
+  const token = authHeader.split('Bearer ')[1]?.trim();
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      error: 'UNAUTHORIZED',
+      message: 'Jeton vide ou invalide.'
+    });
+  }
+
+  try {
+    const verified = await verifyFirebaseToken(token);
+    req.user = verified;
+    next();
+  } catch (err: any) {
+    return res.status(401).json({
+      success: false,
+      error: 'INVALID_TOKEN',
+      message: 'Jeton d\'authentification invalide ou expiré.'
+    });
+  }
+}
+
+// Middleware Super Administrateur (vérifié strictement via custom claim côté serveur)
+function requireSuperAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  if (!req.user) {
+    return res.status(401).json({ error: 'UNAUTHORIZED' });
+  }
+
+  const superAdminUids = getSuperAdminUids();
+  const isSuperAdmin = req.user.isSuperAdmin || req.user.role === 'superadmin' || superAdminUids.has(req.user.uid);
+
+  if (!isSuperAdmin) {
+    return res.status(403).json({
+      success: false,
+      error: 'FORBIDDEN',
+      message: 'Accès strictement réservé au Super Administrateur de la plateforme.'
+    });
+  }
+  next();
+}
+
+// =========================================================================
+// 1. ROUTE PUBLIQUE : FORMULAIRE PROSPECT (LEAD)
+// =========================================================================
+app.post('/api/public/lead', async (req: Request, res: Response) => {
+  const { hp_field, name, email, company, phone, projectType, description, estimatedBudget, desiredDeadline } = req.body;
+
+  if (hp_field) {
+    console.warn('[Anti-Spam] Honeypot triggered, ignoring');
+    return res.status(200).json({ success: true, message: 'Demande reçue' });
+  }
+
+  const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(publicLeadIpLimits, clientIp, 5, 10 * 60 * 1000)) {
+    return res.status(429).json({ error: 'Trop de demandes envoyées. Veuillez patienter.' });
+  }
+
+  if (!name || !email || !description) {
+    return res.status(400).json({ error: 'Champs obligatoires manquants (nom, email, description).' });
+  }
+
+  const leadId = `lead_${Date.now()}`;
+  const adminEmail = getAdminEmail();
+  const adminEmailContent = buildAdminNotificationEmail({
+    clientName: name,
+    clientEmail: email,
+    clientPhone: phone,
+    clientCompany: company,
+    projectType: projectType || 'Création graphique',
+    projectTitle: `Demande de ${company || name}`,
+    description,
+    estimatedBudget,
+    desiredDeadline,
+    orderNumber: leadId,
+    adminUrl: `${req.protocol}://${req.get('host')}/`
+  });
+
+  sendEmailSafe({
+    to: adminEmail,
+    subject: adminEmailContent.subject,
+    html: adminEmailContent.html,
+    text: adminEmailContent.text,
+    templateKey: 'notification_admin',
+    recipientName: 'Studio (Admin)',
+    ip: clientIp
+  }).catch(err => console.warn('[Email Warning] Failed to notify admin:', err.message));
+
+  const clientAckEmail = buildClientConfirmationEmail({
+    clientName: name,
+    orderNumber: leadId,
+    projectTitle: `Votre demande de création (${projectType || 'Design graphique'})`,
+    items: [{
+      description: `Étude préliminaire & cadrage : ${description.slice(0, 80)}...`,
+      quantity: 1,
+      unitPrice: 0,
+      total: 0
+    }],
+    totalHT: 0,
+    totalTTC: 0,
+    notes: 'Nous avons bien reçu votre demande. Un devis vous sera transmis sous 24 à 48 heures.'
+  });
+
+  sendEmailSafe({
+    to: email,
+    subject: 'Accusé de réception de votre demande — Studio Graphique',
+    html: clientAckEmail.html,
+    text: clientAckEmail.text,
+    templateKey: 'confirmation_client',
+    recipientName: name,
+    ip: clientIp
+  }).catch(err => console.warn('[Email Warning] Failed to send client ack:', err.message));
+
+  return res.status(200).json({
+    success: true,
+    leadId,
+    message: 'Votre demande a été transmise avec succès au studio.'
+  });
+});
+
+// =========================================================================
+// 2. PORTAIL CLIENT DÉDIÉ (Accès par jeton via serveur, aucun accès direct Firestore)
+// =========================================================================
+
+app.get('/api/portal/project', async (req: Request, res: Response) => {
+  const token = req.query.token as string;
+  const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+
+  if (!checkRateLimit(portalIpLimits, clientIp, 30, 60 * 1000)) {
+    return res.status(429).json({ success: false, error: 'RATE_LIMIT_EXCEEDED' });
+  }
+
+  if (!token || typeof token !== 'string') {
+    return res.status(400).json({ success: false, error: 'TOKEN_REQUIRED' });
+  }
+
+  const result = await getClientPortalDataByToken(token);
+  if (!result.success) {
+    return res.status(404).json({ success: false, error: result.error || 'PORTAL_NOT_FOUND' });
+  }
+
+  return res.status(200).json(result);
+});
+
+app.post('/api/portal/feedback', async (req: Request, res: Response) => {
+  const { token, comment, roundIndex, versionIndex, pinCoords } = req.body;
+  const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+
+  if (!checkRateLimit(portalIpLimits, clientIp, 15, 60 * 1000)) {
+    return res.status(429).json({ success: false, error: 'RATE_LIMIT_EXCEEDED' });
+  }
+
+  if (!token || !comment) {
+    return res.status(400).json({ success: false, error: 'MISSING_FIELDS' });
+  }
+
+  const result = await getClientPortalDataByToken(token);
+  if (!result.success || !result.project) {
+    return res.status(404).json({ success: false, error: 'PORTAL_NOT_FOUND' });
+  }
+
+  try {
+    const feedbackEntry = {
+      id: `fb_${Date.now()}`,
+      author: 'client',
+      comment: String(comment).slice(0, 1000),
+      roundIndex: Number(roundIndex) || 0,
+      versionIndex: Number(versionIndex) || 0,
+      pinCoords: pinCoords || null,
+      createdAt: new Date().toISOString()
+    };
+
+    const projectRef = adminDb.collection('projects').doc(result.project.id);
+    const existing = (await projectRef.get()).data();
+    const existingFeedback = existing?.feedback || [];
+    await projectRef.update({
+      feedback: [...existingFeedback, feedbackEntry],
+      updatedAt: new Date().toISOString()
+    });
+
+    return res.status(200).json({ success: true, message: 'Retour transmis avec succès' });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Signature électronique sécurisée de devis côté portail
+app.post('/api/portal/sign-quote', async (req: Request, res: Response) => {
+  const { token, quoteId, signatoryName, signatureDataUrl } = req.body;
+  if (!token || !quoteId || !signatoryName || !signatureDataUrl) {
+    return res.status(400).json({ success: false, error: 'MISSING_FIELDS' });
+  }
+
+  const result = await getClientPortalDataByToken(token);
+  if (!result.success || !result.project) {
+    return res.status(404).json({ success: false, error: 'PORTAL_NOT_FOUND' });
+  }
+
+  try {
+    const quoteRef = adminDb.collection('quotes').doc(quoteId);
+    const quoteSnap = await quoteRef.get();
+    if (!quoteSnap.exists || quoteSnap.data()?.projectId !== result.project.id) {
+      return res.status(404).json({ success: false, error: 'QUOTE_NOT_FOUND' });
+    }
+
+    await quoteRef.update({
+      status: 'accepted',
+      acceptedAt: new Date().toISOString(),
+      signatoryName,
+      signatureDataUrl,
+      updatedAt: new Date().toISOString()
+    });
+
+    return res.status(200).json({ success: true, message: 'Devis signé et scellé avec succès.' });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// =========================================================================
+// 3. AUTHENTIFICATION & PROFILS UTILISATEURS (EXCLUSIVEMENT VIA JETON)
+// =========================================================================
+
+// Envoi d'un code de vérification par email
+app.post('/api/auth/send-verification-code', async (req: Request, res: Response) => {
+  const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(authRateLimits, clientIp, 5, 60 * 1000)) {
+    return res.status(429).json({ success: false, error: 'RATE_LIMIT_EXCEEDED', message: 'Trop de requêtes. Veuillez patienter.' });
+  }
+
+  const { email, userId, studioName } = req.body;
+  if (!email || typeof email !== 'string' || !email.includes('@')) {
+    return res.status(400).json({ success: false, error: 'INVALID_EMAIL', message: 'Adresse email valide requise.' });
+  }
+
+  const cleanEmail = email.trim().toLowerCase();
+  const issueResult = issueVerificationCode(cleanEmail, userId);
+  if (!issueResult.success) {
+    return res.status(429).json({
+      success: false,
+      error: issueResult.error,
+      remainingSeconds: issueResult.remainingSeconds,
+      message: issueResult.message
+    });
+  }
+
+  const code = issueResult.code!;
+  const emailContent = buildVerificationCodeEmail({
+    code,
+    recipientEmail: cleanEmail,
+    studioName: studioName || 'eyes-onwork',
+    expirationMinutes: 10
+  });
+
+  const sendResult = await sendEmailSafe({
+    to: cleanEmail,
+    subject: emailContent.subject,
+    html: emailContent.html,
+    text: emailContent.text,
+    templateKey: 'verification_code',
+    recipientName: cleanEmail,
+    studioName: studioName || 'eyes-onwork',
+    workspaceId: 'auth_verification',
+    ip: clientIp
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Code de vérification envoyé avec succès.',
+    expiresAt: issueResult.expiresAt,
+    cooldownSeconds: 60,
+    mode: sendResult.mode
+  });
+});
+
+// Validation du code de vérification et marquage emailVerified via Admin SDK
+app.post('/api/auth/verify-code', async (req: Request, res: Response) => {
+  const { email, code, uid } = req.body;
+  if (!email || !code) {
+    return res.status(400).json({ success: false, error: 'MISSING_FIELDS', message: 'Email et code requis.' });
+  }
+
+  const verifyResult = verifySubmittedCode(email, code);
+  if (!verifyResult.success) {
+    return res.status(400).json(verifyResult);
+  }
+
+  // Marque l'email comme vérifié dans Firebase Auth et Firestore via Admin SDK
+  if (uid) {
+    await markUserEmailVerifiedInAuth(uid);
+    await setServerUserProfile(uid, { emailVerified: true, emailVerifiedAt: new Date().toISOString() }, true);
+  }
+
+  return res.status(200).json({
+    success: true,
+    verified: true,
+    message: 'Votre adresse email a été vérifiée avec succès.'
+  });
+});
+
+// Statut de vérification
+app.get('/api/auth/verification-status', (req: Request, res: Response) => {
+  const email = (req.query.email as string) || '';
+  if (!email) return res.status(400).json({ error: 'Email requis' });
+  const status = getVerificationStatus(email);
+  return res.status(200).json(status);
+});
+
+// Profil utilisateur : EXCLUSIVEMENT protégé par Authorization: Bearer <jeton Firebase>
+// Seul le serveur écrit emailVerified, termsAcceptedVersion, plan et workspaceId
+app.get('/api/user/profile', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const user = req.user!;
+  try {
+    let profile = await getServerUserProfile(user.uid);
+    if (!profile) {
+      // Création automatique au premier login avec attributs gérés exclusivement par le serveur
+      profile = {
+        uid: user.uid,
+        email: user.email || '',
+        displayName: user.rawToken?.name || '',
+        role: user.role || 'user',
+        plan: 'free',
+        emailVerified: Boolean(user.emailVerified),
+        workspaceId: `ws_${user.uid.slice(0, 8)}`,
+        termsAcceptedVersion: null,
+        onboardingCompleted: false,
+        createdAt: new Date().toISOString()
+      };
+      await setServerUserProfile(user.uid, profile, false);
+    }
+    return res.status(200).json({ success: true, profile });
+  } catch (err: any) {
+    const errorMsg = err?.message || String(err);
+    logInternalError(`[FirestoreAdmin 503] GET /api/user/profile failed for ${user.uid}: ${errorMsg}`, 'server', { path: '/api/user/profile' });
+    return res.status(503).json({
+      success: false,
+      error: 'SERVICE_UNAVAILABLE',
+      message: `Erreur d'accès base de données Firestore Admin: ${errorMsg}`
+    });
+  }
+});
+
+// Mise à jour du profil utilisateur (protégé par jeton, champs sensibles strictement interdits au client)
+app.post('/api/user/profile', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const user = req.user!;
+  const allowedUpdates = { ...req.body };
+
+  // Le serveur seul écrit ces champs : interdiction formelle au client
+  delete allowedUpdates.role;
+  delete allowedUpdates.isSuperAdmin;
+  delete allowedUpdates.admin;
+  delete allowedUpdates.plan;
+  delete allowedUpdates.emailVerified;
+  delete allowedUpdates.workspaceId;
+  delete allowedUpdates.termsAcceptedVersion;
+
+  try {
+    await setServerUserProfile(user.uid, allowedUpdates, true);
+    const updated = await getServerUserProfile(user.uid);
+    return res.status(200).json({ success: true, profile: updated });
+  } catch (err: any) {
+    const errorMsg = err?.message || String(err);
+    logInternalError(`[FirestoreAdmin 503] POST /api/user/profile failed for ${user.uid}: ${errorMsg}`, 'server', { path: '/api/user/profile' });
+    return res.status(503).json({
+      success: false,
+      error: 'SERVICE_UNAVAILABLE',
+      message: `Erreur d'écriture Firestore Admin: ${errorMsg}`
+    });
+  }
+});
+
+// Acceptation des conditions d'utilisation (le serveur seul écrit termsAcceptedVersion)
+app.post('/api/auth/accept-terms', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const user = req.user!;
+  const { termsVersion, privacyVersion } = req.body;
+  try {
+    await setServerUserProfile(user.uid, {
+      termsAcceptedVersion: termsVersion || '2026.1',
+      privacyAcceptedVersion: privacyVersion || '2026.1',
+      termsAcceptedAt: new Date().toISOString()
+    }, true);
+    const updated = await getServerUserProfile(user.uid);
+    return res.status(200).json({ success: true, profile: updated, message: 'Conditions acceptées' });
+  } catch (err: any) {
+    const errorMsg = err?.message || String(err);
+    logInternalError(`[FirestoreAdmin 503] POST /api/auth/accept-terms failed for ${user.uid}: ${errorMsg}`, 'server', { path: '/api/auth/accept-terms' });
+    return res.status(503).json({
+      success: false,
+      error: 'SERVICE_UNAVAILABLE',
+      message: `Erreur d'enregistrement des conditions Firestore Admin: ${errorMsg}`
+    });
+  }
+});
+
+// Validation de l'onboarding
+app.post('/api/auth/complete-onboarding', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const user = req.user!;
+  try {
+    await setServerUserProfile(user.uid, {
+      onboardingCompleted: true,
+      onboardingCompletedAt: new Date().toISOString()
+    }, true);
+    const updated = await getServerUserProfile(user.uid);
+    return res.status(200).json({ success: true, profile: updated, message: 'Configuration validée' });
+  } catch (err: any) {
+    const errorMsg = err?.message || String(err);
+    logInternalError(`[FirestoreAdmin 503] POST /api/auth/complete-onboarding failed for ${user.uid}: ${errorMsg}`, 'server', { path: '/api/auth/complete-onboarding' });
+    return res.status(503).json({
+      success: false,
+      error: 'SERVICE_UNAVAILABLE',
+      message: `Erreur validation onboarding Firestore Admin: ${errorMsg}`
+    });
+  }
+});
+
+// =========================================================================
+// 4. ESPACE SUPER ADMINISTRATEUR (PROTECTION STRICTE CÔTÉ SERVEUR)
+// =========================================================================
+
+app.get('/api/admin/email/status', requireFirebaseAuth, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
+  const config = getPlatformProviderConfig();
+  return res.status(200).json(config);
+});
+
+app.get('/api/admin/email/logs', requireFirebaseAuth, requireSuperAdmin, (req: AuthenticatedRequest, res: Response) => {
+  return res.status(200).json({
+    logs: getEmailLogs(),
+    adminAlertEmail: getPlatformAdminEmail()
+  });
+});
+
+app.post('/api/admin/email/test', requireFirebaseAuth, requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
+  const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+  const targetEmail = req.body?.to || getPlatformAdminEmail();
+  const testContent = buildTestEmail({ recipientEmail: targetEmail, isPlatformTest: true });
+
+  try {
+    const result = await sendEmailSafe({
+      to: targetEmail,
+      subject: testContent.subject,
+      html: testContent.html,
+      text: testContent.text,
+      templateKey: 'test_platform',
+      recipientName: 'Super Administrateur',
+      studioName: 'eyes-onwork Plateforme',
+      workspaceId: 'platform_system',
+      ip: clientIp
+    });
+
+    return res.status(200).json({
+      success: result.success,
+      mode: result.mode,
+      targetEmail,
+      messageId: result.messageId,
+      error: result.error
+    });
+  } catch (err: any) {
+    return res.status(200).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/admin/storage/health', requireFirebaseAuth, requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const health = await runStorageHealthDiagnostic();
+    return res.status(200).json(health);
+  } catch (err: any) {
+    return res.status(500).json({ connected: false, error: err.message });
+  }
+});
+
+// Attribution du rôle Super Admin par custom claims Firebase Auth
+app.post('/api/admin/set-claim', requireFirebaseAuth, requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
+  const { targetUid, isSuperAdmin } = req.body;
+  if (!targetUid) {
+    return res.status(400).json({ success: false, error: 'TARGET_UID_REQUIRED' });
+  }
+  try {
+    await setSuperAdminClaim(targetUid, Boolean(isSuperAdmin));
+    return res.status(200).json({ success: true, message: `Rôle mis à jour pour ${targetUid}` });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// =========================================================================
+// 5. SERVICES MESSAGERIE & NOTIFICATIONS WORKSPACE (PROTÉGÉS PAR AUTH)
+// =========================================================================
+
+app.post('/api/email/test', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+  const { to, studioName, replyTo, workspaceId = 'ws_freelance' } = req.body;
+
+  if (!to) return res.status(400).json({ error: 'Adresse email requise.' });
+
+  const testContent = buildTestEmail({ recipientEmail: to, studioName, isPlatformTest: false });
+  try {
+    const result = await sendEmailSafe({
+      to,
+      subject: testContent.subject,
+      html: testContent.html,
+      text: testContent.text,
+      templateKey: 'test_workspace',
+      recipientName: studioName || 'Freelance',
+      studioName,
+      replyTo,
+      workspaceId,
+      ip: clientIp
+    });
+    return res.status(200).json(result);
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/email/logs', requireFirebaseAuth, (req: AuthenticatedRequest, res: Response) => {
+  const workspaceId = (req.query.workspaceId as string) || '';
+  if (!workspaceId) return res.status(200).json({ logs: [] });
+  const logs = getEmailLogs(workspaceId);
+  return res.status(200).json({ logs });
+});
+
+app.post('/api/email/send-confirmation', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+  const {
+    to,
+    clientName,
+    orderNumber,
+    projectTitle,
+    items = [],
+    totalHT = 0,
+    vatRate,
+    totalTTC = 0,
+    depositAmount,
+    balanceDue,
+    trackingUrl,
+    notes,
+    workspaceId = 'ws_default',
+    studioName,
+    replyTo
+  } = req.body;
+
+  if (!to || !clientName) {
+    return res.status(400).json({ error: 'to et clientName requis' });
+  }
+
+  const quotaCheck = checkWorkspaceMonthlyLimit(workspaceId, 30);
+  if (!quotaCheck.allowed) {
+    return res.status(403).json({
+      success: false,
+      error: `Plafond mensuel d’envois atteint (${quotaCheck.currentCount}/${quotaCheck.maxAllowed}).`
+    });
+  }
+
+  const emailData = buildClientConfirmationEmail({
+    clientName,
+    orderNumber: orderNumber || `CMD-${Date.now().toString().slice(-6)}`,
+    projectTitle: projectTitle || 'Prestations Graphiques',
+    items,
+    totalHT: Number(totalHT),
+    vatRate: vatRate !== undefined ? Number(vatRate) : undefined,
+    totalTTC: Number(totalTTC || totalHT),
+    depositAmount: depositAmount !== undefined ? Number(depositAmount) : undefined,
+    balanceDue: balanceDue !== undefined ? Number(balanceDue) : undefined,
+    trackingUrl,
+    notes,
+    studioName,
+    replyTo
+  });
+
+  const sendResult = await sendEmailSafe({
+    to,
+    subject: emailData.subject,
+    html: emailData.html,
+    text: emailData.text,
+    templateKey: 'confirmation_client',
+    recipientName: clientName,
+    studioName,
+    replyTo,
+    workspaceId,
+    ip: clientIp
+  });
+
+  return res.status(200).json(sendResult);
+});
+
+app.post('/api/email/send-receipt', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+  const {
+    to,
+    clientName,
+    invoiceNumber,
+    projectTitle,
+    amountPaid,
+    totalInvoiceTTC,
+    balanceRemaining,
+    paymentMethod = 'Virement bancaire',
+    paymentDate,
+    downloadUrl,
+    isFullPayment = false,
+    workspaceId = 'ws_default',
+    studioName,
+    replyTo
+  } = req.body;
+
+  if (!to || !clientName || amountPaid === undefined) {
+    return res.status(400).json({ error: 'to, clientName et amountPaid requis' });
+  }
+
+  const emailData = buildPaymentReceiptEmail({
+    clientName,
+    invoiceNumber: invoiceNumber || 'FAC-2026-001',
+    projectTitle: projectTitle || 'Prestations Graphiques',
+    amountPaid: Number(amountPaid),
+    totalInvoiceTTC: Number(totalInvoiceTTC || amountPaid),
+    balanceRemaining: Number(balanceRemaining || 0),
+    paymentMethod,
+    paymentDate: paymentDate || new Date().toLocaleDateString('fr-FR'),
+    downloadUrl,
+    isFullPayment: Boolean(isFullPayment || (balanceRemaining <= 0)),
+    studioName,
+    replyTo
+  });
+
+  const sendResult = await sendEmailSafe({
+    to,
+    subject: emailData.subject,
+    html: emailData.html,
+    text: emailData.text,
+    templateKey: 'recu_facture',
+    recipientName: clientName,
+    studioName,
+    replyTo,
+    workspaceId,
+    ip: clientIp
+  });
+
+  return res.status(200).json(sendResult);
+});
+
+app.post('/api/email/send', requireFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+  const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+  const { to, subject, html, text, templateKey = 'custom', recipientName, workspaceId = 'ws_default', studioName, replyTo } = req.body;
+
+  if (!to || !subject) return res.status(400).json({ error: 'to et subject requis' });
+
+  const result = await sendEmailSafe({
+    to,
+    subject,
+    html: html || `<p>${text || subject}</p>`,
+    text: text || '',
+    templateKey,
+    recipientName,
+    studioName,
+    replyTo,
+    workspaceId,
+    ip: clientIp
+  });
+  return res.status(200).json(result);
+});
+
+// =========================================================================
+// 6. UPLOAD SÉCURISÉ & DIAGNOSTIC SANTÉ SYSTÈME
+// =========================================================================
+
+const FORBIDDEN_SERVER_EXT = new Set([
+  'exe', 'bat', 'cmd', 'sh', 'php', 'phtml', 'py', 'js', 'mjs',
+  'vbs', 'jar', 'bin', 'msi', 'com', 'scr', 'dll', 'reg', 'hta', 'html', 'htm'
+]);
+
+app.post('/api/upload', requireFirebaseAuth, (req: AuthenticatedRequest, res: Response) => {
+  const { fileName, size, contentType, dataUrl } = req.body;
+  if (!fileName || typeof fileName !== 'string') {
+    return res.status(400).json({ success: false, error: 'Nom de fichier invalide.' });
+  }
+
+  const maxBytes = 50 * 1024 * 1024;
+  const fileSize = Number(size) || 0;
+  if (fileSize > maxBytes) {
+    return res.status(413).json({ success: false, error: 'Fichier trop volumineux (max 50 Mo).' });
+  }
+
+  const ext = fileName.split('.').pop()?.toLowerCase() || '';
+  if (FORBIDDEN_SERVER_EXT.has(ext)) {
+    logInternalError(`Format interdit refusé: ${fileName}`, 'client', { ip: req.ip });
+    return res.status(403).json({ success: false, error: `Format strictement refusé (.${ext}).` });
+  }
+
+  const baseName = fileName.split(/[/\\]/).pop() || 'fichier';
+  const cleanName = baseName.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 100);
+  const finalName = `${Date.now()}_${cleanName}`;
+
+  return res.status(200).json({
+    success: true,
+    file: {
+      originalName: fileName,
+      sanitizedName: finalName,
+      size: fileSize,
+      contentType: contentType || 'application/octet-stream',
+      url: dataUrl || `/uploads/${finalName}`,
+      uploadedAt: new Date().toISOString()
+    }
+  });
+});
+
+// Santé du système (public) avec diagnostic Firestore Admin (écriture puis lecture)
+app.get('/api/system/health', (req: Request, res: Response) => {
+  const mem = process.memoryUsage();
+  return res.status(200).json({
+    status: 'healthy',
+    uptimeSeconds: Math.floor(process.uptime()),
+    environment: process.env.NODE_ENV || 'development',
+    serverTime: new Date().toISOString(),
+    firestoreAdmin: getStartupFirestoreTestResult(),
+    smtp: {
+      configured: Boolean(getMailTransporter()),
+      sender: formatSenderAddress('Studio'),
+      adminEmail: getAdminEmail()
+    },
+    security: {
+      securityHeaders: true,
+      rateLimitingActive: true,
+      xssSanitizationActive: true,
+      corsRestricted: true,
+      maxUploadSizeMb: 50,
+      zeroTrustActive: true
+    },
+    memory: {
+      rssMb: (mem.rss / (1024 * 1024)).toFixed(1),
+      heapUsedMb: (mem.heapUsed / (1024 * 1024)).toFixed(1)
+    },
+    recentErrorsCount: serverErrorLogs.length
+  });
+});
+
+// Test à chaud d'écriture puis de lecture Firestore Admin (déclenchable depuis Santé du système)
+app.post('/api/system/test-firestore', async (req: Request, res: Response) => {
+  try {
+    const result = await testFirestoreAdminConnection();
+    return res.status(200).json(result);
+  } catch (err: any) {
+    return res.status(500).json({ status: 'error', error: err.message });
+  }
+});
+
+app.get('/api/system/errors', (req: Request, res: Response) => {
+  return res.status(200).json({ errors: serverErrorLogs.slice(0, 50) });
+});
+
+app.post('/api/system/log-error', (req: Request, res: Response) => {
+  const { message, stack, path: errPath } = req.body;
+  const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+  if (message) {
+    logInternalError(message, 'client', { stack, path: errPath, ip: clientIp });
+  }
+  return res.status(200).json({ received: true });
+});
+
+// =========================================================================
+// 7. INITIALISATION DU SERVEUR ET MONTEUR VITE
+// =========================================================================
+
+async function startServer() {
+  // Test d'accès Firestore Admin au démarrage (écriture puis lecture)
+  console.log('[FirebaseAdmin] Testing Firestore Admin read/write probe on startup...');
+  try {
+    const probeRes = await testFirestoreAdminConnection();
+    console.log(`[FirebaseAdmin] Startup Firestore probe status: ${probeRes.status} (write: ${probeRes.writeLatencyMs}ms, read: ${probeRes.readLatencyMs}ms)`);
+  } catch (err: any) {
+    console.error('[FirebaseAdmin] Startup Firestore probe error:', err.message);
+  }
+
+  if (process.env.NODE_ENV === 'production') {
+    app.use(express.static(path.join(__dirname, 'dist')));
+    app.get('*', (req: Request, res: Response) => {
+      res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+    });
+  } else {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true, hmr: false, ws: false },
+      appType: 'spa'
+    });
+    app.use(vite.middlewares);
+  }
+
+  const serverInstance = app.listen(Number(PORT), '0.0.0.0', () => {
+    console.log(`[eyes-onwork] Server running on port ${PORT}`);
+    console.log(`[SMTP Gmail] Sender: ${formatSenderAddress('Studio')}`);
+    console.log(`[SMTP Gmail] Admin notification email: ${getAdminEmail()}`);
+  });
+
+  serverInstance.on('error', (err: any) => {
+    if (err && err.code === 'EADDRINUSE') {
+      console.warn(`[eyes-onwork] Port ${PORT} already in use. Continuing without crash.`);
+    } else {
+      console.error('[eyes-onwork] Server error:', err);
+    }
+  });
+}
+
+startServer();

@@ -83,21 +83,24 @@ body {
 /* Global Panels & Cards */
 .glass-panel {
   background-color: var(--card-surface);
+  color: var(--text-primary);
   border: 1px solid var(--border-card);
   border-radius: 1rem;
   box-shadow: var(--shadow-card);
-  transition: background-color 0.2s ease, border-color 0.2s ease;
+  transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
 }
 
 .glass-panel-alt {
   background-color: var(--card-surface-alt);
+  color: var(--text-primary);
   border: 1px solid var(--border-subtle);
   border-radius: 0.75rem;
-  transition: background-color 0.2s ease, border-color 0.2s ease;
+  transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
 }
 
 .glass-panel-elevated {
   background-color: var(--card-surface-elevated);
+  color: var(--text-primary);
   border: 1px solid var(--border-color);
   border-radius: 1rem;
   box-shadow: var(--shadow-card);
@@ -261,13 +264,21 @@ html.light .bg-red-600 .text-white,
 html.light [class*="bg-red-"] .text-white,
 html.light [class*="bg-[#d9"] .text-white,
 html.light [class*="bg-[#D9"] .text-white,
-html.light .bg-[#0f0326] .text-white,
-html.light .bg-[#0B0F1A] .text-white,
 html.light .btn-danger,
 [data-theme="light"] [class*="bg-red"] .text-white,
 [data-theme="light"] [class*="bg-[#d9"] .text-white,
 [data-theme="light"] [class*="bg-[#D9"] .text-white {
   color: #ffffff !important;
+}
+
+/* Explicit focus mode element enforcement for high contrast in Light Mode */
+html.light div#root > div:nth-of-type(1) > div:nth-of-type(2) > main:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(3) > div:nth-of-type(1) > div:nth-of-type(2) > div:nth-of-type(2),
+[data-theme="light"] div#root > div:nth-of-type(1) > div:nth-of-type(2) > main:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(3) > div:nth-of-type(1) > div:nth-of-type(2) > div:nth-of-type(2),
+.light div#root > div:nth-of-type(1) > div:nth-of-type(2) > main:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(3) > div:nth-of-type(1) > div:nth-of-type(2) > div:nth-of-type(2),
+html.light div#root > div:nth-of-type(1) > div:nth-of-type(2) > main:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(3) > div:nth-of-type(1) > div:nth-of-type(2) > div:nth-of-type(2) *:not([class*="bg-[#f7c548]"]):not([class*="bg-[#5FB59A]"]):not([class*="bg-[#D9695F]"]):not([class*="bg-[#d9534f]"]),
+[data-theme="light"] div#root > div:nth-of-type(1) > div:nth-of-type(2) > main:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(3) > div:nth-of-type(1) > div:nth-of-type(2) > div:nth-of-type(2) *:not([class*="bg-[#f7c548]"]):not([class*="bg-[#5FB59A]"]):not([class*="bg-[#D9695F]"]):not([class*="bg-[#d9534f]"]),
+.light div#root > div:nth-of-type(1) > div:nth-of-type(2) > main:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(3) > div:nth-of-type(1) > div:nth-of-type(2) > div:nth-of-type(2) *:not([class*="bg-[#f7c548]"]):not([class*="bg-[#5FB59A]"]):not([class*="bg-[#D9695F]"]):not([class*="bg-[#d9534f]"]) {
+  color: #1d1335 !important;
 }
 
 /* Soft cream text becomes dark plum in light mode */

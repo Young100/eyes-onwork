@@ -99,7 +99,7 @@ export const SubscriptionView: React.FC = () => {
       {/* Header */}
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-extrabold text-white font-display">
+          <h1 className="text-2xl sm:text-3xl font-extrabold text-[var(--text-primary)] font-display">
             Abonnement & Formule Studio
           </h1>
           <p className="text-xs text-[#8E97AB] mt-0.5">
@@ -130,14 +130,14 @@ export const SubscriptionView: React.FC = () => {
 
       {/* Plan Status Card */}
       <div className="glass-panel p-6 sm:p-8 space-y-6 relative overflow-hidden">
-        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 pb-6 border-b border-white/10">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 pb-6 border-b border-[var(--border-subtle)]">
           <div className="flex items-center gap-4">
             <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-[#1A253E] to-[#0E1626] border border-[#f7c548]/40 text-[#f7c548] flex items-center justify-center font-bold text-xl font-display shadow-lg">
               {isPro ? 'PRO' : 'FREE'}
             </div>
             <div>
               <div className="flex items-center gap-2.5">
-                <h2 className="text-lg font-bold text-white font-display">
+                <h2 className="text-lg font-bold text-[var(--text-primary)] font-display">
                   Formule {plan.name}
                 </h2>
                 <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${

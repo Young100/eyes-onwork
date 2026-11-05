@@ -1,4 +1,17 @@
 import crypto from 'crypto';
+import { persistUserToFirestore, fetchAllUsersFromFirestore } from './firestoreAdmin.js';
+
+export const RECOGNIZED_SUPER_ADMIN_EMAILS = [
+  'ouattaraabdoulaye479@gmail.com',
+  'abdoulayegraphic@gmail.com',
+  'admin@eyesonwork.fr'
+];
+
+export function isSuperAdminEmail(email?: string | null): boolean {
+  if (!email) return false;
+  const clean = email.trim().toLowerCase();
+  return RECOGNIZED_SUPER_ADMIN_EMAILS.some(admin => admin.toLowerCase() === clean);
+}
 
 export interface UserProfileRecord {
   uid: string;
@@ -63,12 +76,36 @@ function loadDatabase() {
 function flushUser(user: UserProfileRecord) {
   if (user && user.email) {
     memoryStore.set(user.email.toLowerCase(), user);
+    try {
+      persistUserToFirestore(user).catch(() => {});
+    } catch {}
+  }
+}
+
+export async function syncUsersFromFirestore(): Promise<number> {
+  initIfNeeded();
+  try {
+    const firestoreUsers = await fetchAllUsersFromFirestore();
+    let loaded = 0;
+    for (const u of firestoreUsers) {
+      if (u && u.email) {
+        const clean = u.email.trim().toLowerCase();
+        if (!memoryStore.has(clean)) {
+          memoryStore.set(clean, u);
+          loaded++;
+        }
+      }
+    }
+    return loaded;
+  } catch {
+    return 0;
   }
 }
 
 function initIfNeeded() {
   if (!isInitialized) {
     loadDatabase();
+    syncUsersFromFirestore().catch(() => {});
   }
 }
 
@@ -100,7 +137,7 @@ export function getOrCreateUser(email: string, defaults: Partial<UserProfileReco
     }
     return existing;
   }
-  const isSuper = cleanEmail === "ouattaraabdoulaye479@gmail.com";
+  const isSuper = isSuperAdminEmail(cleanEmail);
   const now = new Date().toISOString();
   const rawPart = cleanEmail.split("@")[0].replace(/[._]/g, " ");
   const defaultName = rawPart.charAt(0).toUpperCase() + rawPart.slice(1);
@@ -252,7 +289,7 @@ export function registerUserWithPassword(
     onboardingCompletedAt: null,
     onboardingStep: 1,
     workspaceId: uniqueWsId,
-    role: cleanEmail === 'ouattaraabdoulaye479@gmail.com' ? 'superadmin' : 'owner',
+    role: isSuperAdminEmail(cleanEmail) ? 'superadmin' : 'owner',
     createdAt: now,
     updatedAt: now
   };

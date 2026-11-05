@@ -333,8 +333,8 @@ export const SuperAdminView: React.FC<SuperAdminViewProps> = ({ onExit }) => {
 
   // Filtered workspaces list
   const filteredWorkspaces = allWorkspaces.filter((w: Workspace) => {
-    const matchesSearch = w.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
-                          w.ownerEmail.toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesSearch = (w.name || '').toLowerCase().includes(searchQuery.toLowerCase()) || 
+                          (w.ownerEmail || '').toLowerCase().includes(searchQuery.toLowerCase());
     const matchesStatus = statusFilter === 'all' || w.planStatus === statusFilter;
     return matchesSearch && matchesStatus;
   });
@@ -584,7 +584,7 @@ export const SuperAdminView: React.FC<SuperAdminViewProps> = ({ onExit }) => {
                     <tr key={ws.id} className="hover:bg-white/5 transition-colors">
                       <td className="py-3.5 px-4">
                         <div className="font-bold text-white">{ws.name}</div>
-                        <div className="text-[11px] text-[#8E97AB]">{ws.ownerEmail}</div>
+                        <div className="text-[11px] text-[#8E97AB]">{ws.ownerEmail || 'Non spécifié'}</div>
                       </td>
 
                       <td className="py-3.5 px-4">
@@ -645,7 +645,7 @@ export const SuperAdminView: React.FC<SuperAdminViewProps> = ({ onExit }) => {
                   Gestion du compte : {selectedWorkspace.name}
                 </h3>
                 <p className="text-xs text-[#8E97AB]">
-                  {selectedWorkspace.ownerEmail} · ID : {selectedWorkspace.id}
+                  {selectedWorkspace.ownerEmail || 'Non spécifié'} · ID : {selectedWorkspace.id}
                 </p>
               </div>
               <button

@@ -57,6 +57,7 @@ export const INITIAL_DEMO_WORKSPACES: Workspace[] = [
     id: 'ws_default',
     name: 'Atelier Graphique Paris',
     ownerId: 'designer_solene',
+    ownerEmail: 'contact@atelierparis.fr',
     planId: 'free',
     createdAt: '2026-01-01T00:00:00Z'
   }
@@ -159,11 +160,18 @@ export function calculateEntitlements(
   };
 }
 
-export const SUPER_ADMIN_EMAIL = 'admin@eyesonwork.fr';
+export const SUPER_ADMIN_EMAILS = [
+  'ouattaraabdoulaye479@gmail.com',
+  'abdoulayegraphic@gmail.com',
+  'admin@eyesonwork.fr'
+];
+
+export const SUPER_ADMIN_EMAIL = 'ouattaraabdoulaye479@gmail.com';
 
 export function isSuperAdminUser(email?: string): boolean {
   if (!email) return false;
-  return email.toLowerCase() === SUPER_ADMIN_EMAIL.toLowerCase();
+  const clean = email.trim().toLowerCase();
+  return SUPER_ADMIN_EMAILS.some(admin => admin.toLowerCase() === clean);
 }
 
 export function migrateLegacyDataToWorkspace(workspaceId: string, items: any[]): any[] {

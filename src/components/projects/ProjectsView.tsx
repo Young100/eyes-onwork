@@ -241,7 +241,7 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
                         {(client?.name || 'CL').slice(0, 2).toUpperCase()}
                       </div>
                     </div>
-                    <div className="font-mono font-bold text-[var(--text-primary)] text-xs tabular-nums">
+                    <div className="font-mono font-bold text-[#1d1335] dark:text-[#eeebd3] text-xs tabular-nums">
                       {formatCurrencySafe(project.totalTTC || project.budget, profile?.currency || 'EUR')}
                     </div>
                   </div>

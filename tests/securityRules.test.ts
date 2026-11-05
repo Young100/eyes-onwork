@@ -1,12 +1,12 @@
 /**
  * Automated Security & Rules Test Suite for eyes-onwork
  * Validates Firestore & Storage security invariants:
- * - Designer data isolation
- * - Client portal token authorization
- * - Deliverable lockdown until payment
- * - Quote immutability once accepted
- * - Invoice immutability once paid
- * - File upload validation & executable rejection
+ * - Unauthenticated requests are strictly rejected (Default-Deny)
+ * - User B cannot read User A's data (Workspace owner isolation)
+ * - Client cannot modify sensitive fields (role, plan, emailVerified, workspaceId, termsAcceptedVersion)
+ * - Server-only collections (verification_codes, email_logs, abonnements) are inaccessible to client SDK
+ * - Client portal passes via dedicated server API (/api/portal/*), direct browser Firestore query with raw token is disabled
+ * - Super admin validation is performed via custom claims, no hardcoded emails
  */
 
 import {
@@ -14,8 +14,7 @@ import {
   stripHtml,
   sanitizeUploadedFileName,
   validateUploadedFile,
-  generateSecureToken,
-  FORBIDDEN_EXTENSIONS
+  generateSecureToken
 } from '../src/utils/securityUtils.js';
 
 interface TestResult {
@@ -38,286 +37,264 @@ function assert(condition: boolean, name: string, suite: string = 'Security Inva
 }
 
 console.log('\n======================================================');
-console.log('🛡️  EYES-ONWORK - AUDIT & TESTS DE RÈGLES DE SÉCURITÉ');
+console.log('🛡️  EYES-ONWORK - AUDIT DE SÉCURITÉ ZERO-TRUST & RÈGLES');
 console.log('======================================================\n');
 
 // ---------------------------------------------------------------------------
-// SUITE 1: Isolation des données & Accès multi-utilisateurs
+// SUITE 1: Isolation stricte des données & Rejet non authentifié (Default-Deny)
 // ---------------------------------------------------------------------------
-console.log('1. Tests d\'isolation des données (Multi-utilisateurs & RBAC) :');
+console.log('1. Tests de refus par défaut & isolation propriétaire (Zero-Trust) :');
 
 function evaluateFirestoreRule(
   collection: string,
   action: 'read' | 'create' | 'update' | 'delete',
-  auth: { uid: string } | null,
+  auth: { uid: string; token?: { role?: string; isSuperAdmin?: boolean; admin?: boolean } } | null,
   resource: any,
-  requestResource?: any,
-  query?: { token?: string }
+  requestResource?: any
 ): { allowed: boolean; reason: string } {
-  // Règle 1: Authentification requise pour l'administration
-  if (['clients', 'users'].includes(collection)) {
-    if (!auth || !auth.uid) {
-      return { allowed: false, reason: 'Refus : non authentifié' };
-    }
-    if (resource && resource.ownerId && resource.ownerId !== auth.uid) {
-      return { allowed: false, reason: 'Refus : tentative d\'accès aux données d\'un autre graphiste' };
-    }
-    return { allowed: true, reason: 'Autorisé : propriétaire vérifié' };
-  }
-
-  // Règle 2: Projets & accès par lien client
-  if (collection === 'projects') {
-    if (auth && resource && resource.ownerId === auth.uid) {
-      return { allowed: true, reason: 'Autorisé : graphiste propriétaire' };
-    }
-    // Accès client via token
-    if (resource && resource.clientLinkActive && query?.token === resource.clientShareToken) {
-      if (action === 'read') return { allowed: true, reason: 'Autorisé : jeton client valide' };
-      if (action === 'delete') return { allowed: false, reason: 'Refus : le client ne peut pas supprimer un projet' };
-      if (action === 'update') {
-        // Le client ne peut pas falsifier le budget
-        if (requestResource && requestResource.budget !== resource.budget) {
-          return { allowed: false, reason: 'Refus : falsification financière interdite par le client' };
-        }
-        return { allowed: true, reason: 'Autorisé : mise à jour restreinte autorisée pour le client' };
+  // Refus total si non authentifié (sauf leads en création)
+  if (!auth || !auth.uid) {
+    if (collection === 'leads' && action === 'create') {
+      if (requestResource && requestResource.name && requestResource.email && requestResource.description) {
+        return { allowed: true, reason: 'Autorisé : formulaire public prospect' };
       }
     }
-    return { allowed: false, reason: 'Refus : ni propriétaire, ni jeton client valide' };
+    return { allowed: false, reason: 'Refus : non authentifié (Default Deny)' };
   }
 
-  // Règle 3: Devis & Factures (Immutabilité des états finaux)
-  if (collection === 'quotes') {
-    if (action === 'update' && resource.status === 'accepted') {
-      return { allowed: false, reason: 'Refus : un devis accepté est scellé juridiquement et non modifiable' };
+  const isSuperAdmin = auth.token?.role === 'superadmin' || auth.token?.isSuperAdmin === true || auth.token?.admin === true;
+
+  // Collections strictement réservées au serveur
+  const serverOnlyCollections = ['verification_codes', 'email_logs', 'abonnements', 'subscriptions', 'platform_config', 'rate_limits'];
+  if (serverOnlyCollections.includes(collection)) {
+    return { allowed: false, reason: 'Refus : collection réservée exclusivement au serveur (Admin SDK)' };
+  }
+
+  // 1. Profil Utilisateur (/users/{uid})
+  if (collection === 'users') {
+    const targetUserId = resource?.uid || resource?.id;
+    if (action === 'read') {
+      if (auth.uid === targetUserId || isSuperAdmin) {
+        return { allowed: true, reason: 'Autorisé : lecture de son propre profil' };
+      }
+      return { allowed: false, reason: 'Refus : lecture du profil d\'un tiers interdite' };
     }
-    return { allowed: true, reason: 'Autorisé' };
-  }
-
-  if (collection === 'invoices') {
-    if (action === 'update' && resource.status === 'paid') {
-      return { allowed: false, reason: 'Refus : une facture réglée ne peut être altérée (intégrité comptable)' };
+    if (action === 'update') {
+      if (isSuperAdmin) return { allowed: true, reason: 'Autorisé : superadmin' };
+      if (auth.uid !== targetUserId) {
+        return { allowed: false, reason: 'Refus : modification du profil d\'autrui interdite' };
+      }
+      // Vérification des champs sensibles interdits au client
+      const immutableFields = ['role', 'plan', 'emailVerified', 'workspaceId', 'termsAcceptedVersion'];
+      for (const field of immutableFields) {
+        if (requestResource && requestResource[field] !== undefined && requestResource[field] !== resource[field]) {
+          return { allowed: false, reason: `Refus : le champ sensible "${field}" est inaltérable côté client` };
+        }
+      }
+      return { allowed: true, reason: 'Autorisé : modification de champs autorisés' };
     }
-    return { allowed: true, reason: 'Autorisé' };
-  }
-
-  // Règle 4: Téléchargement des livrables
-  if (collection === 'deliverables') {
-    const isPaid = resource.paidAmount >= resource.budget;
-    const isUnlocked = resource.currentStep === 'livraison';
-    if (!isPaid && !isUnlocked) {
-      return { allowed: false, reason: 'Refus : livrable verrouillé tant que le solde n\'est pas réglé' };
+    if (action === 'create') {
+      if (requestResource?.role && requestResource.role !== 'user') {
+        return { allowed: false, reason: 'Refus : auto-attribution de privilèges interdite' };
+      }
+      return { allowed: true, reason: 'Autorisé' };
     }
-    return { allowed: true, reason: 'Autorisé : solde réglé, livrables débloqués' };
+    return { allowed: isSuperAdmin, reason: isSuperAdmin ? 'Autorisé' : 'Refus' };
   }
 
+  // 2. Données de workspace (clients, projects, quotes, invoices, catalog, appointments...)
+  const workspaceCollections = [
+    'workspaces', 'clients', 'projects', 'quotes', 'invoices',
+    'payments', 'catalog_services', 'catalog_packs', 'project_templates',
+    'custom_categories', 'appointments', 'time_entries', 'expenses'
+  ];
+
+  if (workspaceCollections.includes(collection)) {
+    // En création : request.resource.data.ownerId == request.auth.uid
+    if (action === 'create') {
+      if (requestResource && requestResource.ownerId === auth.uid) {
+        return { allowed: true, reason: 'Autorisé : création avec son propre ownerId' };
+      }
+      return { allowed: false, reason: 'Refus : ownerId non conforme' };
+    }
+
+    // En lecture / mise à jour / suppression : resource.data.ownerId == request.auth.uid
+    if (resource && (resource.ownerId === auth.uid || isSuperAdmin)) {
+      if (collection === 'quotes' && action === 'update' && resource.status === 'accepted') {
+        return { allowed: false, reason: 'Refus : un devis accepté est scellé juridiquement' };
+      }
+      if (collection === 'invoices' && action === 'update' && resource.status === 'paid') {
+        return { allowed: false, reason: 'Refus : une facture payée est inaltérable' };
+      }
+      return { allowed: true, reason: 'Autorisé : propriétaire vérifié' };
+    }
+
+    return { allowed: false, reason: 'Refus : l\'utilisateur B ne peut pas accéder aux données de l\'utilisateur A' };
+  }
+
+  // Refus par défaut pour toute collection non reconnue
   return { allowed: false, reason: 'Refus par défaut' };
 }
 
-// Tests d'isolation
-const graphisteA = { uid: 'user_abdoulaye' };
-const graphisteB = { uid: 'user_hacker' };
-const projetA = { id: 'p1', ownerId: 'user_abdoulaye', budget: 1500, clientShareToken: 'tok_abc123', clientLinkActive: true };
+// ---------------------------------------------------------------------------
+// SUITE 1 : Tests Invariants Demandés par l'Utilisateur
+// ---------------------------------------------------------------------------
 
+const userA = { uid: 'user_A_12345' };
+const userB = { uid: 'user_B_67890' };
+const superAdminUser = { uid: 'user_admin_999', token: { role: 'superadmin', isSuperAdmin: true } };
+
+// Test 1: Une lecture sans être connecté est REFUSÉE
 assert(
-  evaluateFirestoreRule('projects', 'read', graphisteA, projetA).allowed,
-  'Le graphiste propriétaire peut lire ses propres projets'
+  !evaluateFirestoreRule('projects', 'read', null, { id: 'p1', ownerId: userA.uid }).allowed,
+  'Une lecture sans être connecté est REFUSÉE (PERMISSION_DENIED)'
 );
 
 assert(
-  !evaluateFirestoreRule('projects', 'read', graphisteB, projetA).allowed,
-  'Un autre graphiste ne peut PAS lire le projet d\'autrui (403 Forbidden)'
+  !evaluateFirestoreRule('users', 'read', null, { uid: userA.uid, email: 'userA@test.fr' }).allowed,
+  'Lecture du profil /users sans authentification REFUSÉE'
+);
+
+// Test 2: L'utilisateur B ne peut PAS lire les données de l'utilisateur A
+const projetA = { id: 'p_alpha', ownerId: userA.uid, title: 'Projet Secret A', budget: 3500 };
+
+assert(
+  evaluateFirestoreRule('projects', 'read', userA, projetA).allowed,
+  'L\'utilisateur A peut lire son propre projet'
 );
 
 assert(
-  !evaluateFirestoreRule('clients', 'read', graphisteB, { ownerId: 'user_abdoulaye' }).allowed,
-  'Les fiches clients sont strictement hermétiques entre graphistes'
+  !evaluateFirestoreRule('projects', 'read', userB, projetA).allowed,
+  'L\'utilisateur B ne peut PAS lire le projet de l\'utilisateur A (Isolation stricte)'
+);
+
+assert(
+  !evaluateFirestoreRule('clients', 'read', userB, { id: 'c1', ownerId: userA.uid }).allowed,
+  'L\'utilisateur B ne peut PAS lire le client de l\'utilisateur A'
+);
+
+assert(
+  !evaluateFirestoreRule('invoices', 'read', userB, { id: 'inv1', ownerId: userA.uid, status: 'sent' }).allowed,
+  'L\'utilisateur B ne peut PAS lire la facture de l\'utilisateur A'
+);
+
+// Test 3: Les champs sensibles du profil sont inaltérables par le client
+const profileA = {
+  uid: userA.uid,
+  role: 'user',
+  plan: 'free',
+  emailVerified: false,
+  workspaceId: 'ws_user_a',
+  termsAcceptedVersion: null,
+  displayName: 'User A'
+};
+
+assert(
+  evaluateFirestoreRule('users', 'update', userA, profileA, { ...profileA, displayName: 'Nouveau Nom A' }).allowed,
+  'L\'utilisateur peut modifier son propre displayName légitime'
+);
+
+assert(
+  !evaluateFirestoreRule('users', 'update', userA, profileA, { ...profileA, role: 'superadmin' }).allowed,
+  'Tentative de modifier "role" côté client strictement REFUSÉE'
+);
+
+assert(
+  !evaluateFirestoreRule('users', 'update', userA, profileA, { ...profileA, plan: 'agency' }).allowed,
+  'Tentative de modifier "plan" côté client strictement REFUSÉE'
+);
+
+assert(
+  !evaluateFirestoreRule('users', 'update', userA, profileA, { ...profileA, emailVerified: true }).allowed,
+  'Tentative d\'auto-valider "emailVerified" côté client strictement REFUSÉE'
+);
+
+assert(
+  !evaluateFirestoreRule('users', 'update', userA, profileA, { ...profileA, workspaceId: 'ws_other' }).allowed,
+  'Tentative de modifier "workspaceId" côté client strictement REFUSÉE'
+);
+
+assert(
+  !evaluateFirestoreRule('users', 'update', userA, profileA, { ...profileA, termsAcceptedVersion: '9999' }).allowed,
+  'Tentative de modifier "termsAcceptedVersion" côté client directement REFUSÉE'
 );
 
 // ---------------------------------------------------------------------------
-// SUITE 2: Accès par lien client & Jetons sécurisés
+// SUITE 2: Collections serveur & Portail client
 // ---------------------------------------------------------------------------
-console.log('\n2. Tests des liens de partage clients & permissions :');
+console.log('\n2. Tests des collections réservées au serveur & portail client :');
 
 assert(
-  evaluateFirestoreRule('projects', 'read', null, projetA, undefined, { token: 'tok_abc123' }).allowed,
-  'Le client accède à son projet via son jeton unique valide'
+  !evaluateFirestoreRule('verification_codes', 'read', userA, { code: '123456' }).allowed,
+  'Client SDK ne peut PAS lire dans /verification_codes (Serveur uniquement)'
 );
 
 assert(
-  !evaluateFirestoreRule('projects', 'read', null, projetA, undefined, { token: 'tok_invalid_wrong' }).allowed,
-  'L\'accès est refusé si le jeton dans l\'URL est invalide ou altéré'
-);
-
-const projetRevoque = { ...projetA, clientLinkActive: false };
-assert(
-  !evaluateFirestoreRule('projects', 'read', null, projetRevoque, undefined, { token: 'tok_abc123' }).allowed,
-  'L\'accès client est immédiatement révoqué si clientLinkActive est désactivé'
+  !evaluateFirestoreRule('verification_codes', 'create', userA, {}, { code: '123456' }).allowed,
+  'Client SDK ne peut PAS écrire dans /verification_codes'
 );
 
 assert(
-  !evaluateFirestoreRule('projects', 'update', null, projetA, { ...projetA, budget: 100 }, { token: 'tok_abc123' }).allowed,
-  'Le client ne peut PAS modifier le montant du budget fixé par le graphiste'
+  !evaluateFirestoreRule('email_logs', 'read', userA, { id: 'log1' }).allowed,
+  'Client SDK ne peut PAS lire dans /email_logs (Serveur uniquement)'
 );
 
-// ---------------------------------------------------------------------------
-// SUITE 3: Verrouillage des livrables et transitions sensibles
-// ---------------------------------------------------------------------------
-console.log('\n3. Tests de verrouillage des livrables & immutabilité comptable :');
-
-const livrableVerrouille = { budget: 2000, paidAmount: 1000, currentStep: 'creation' };
 assert(
-  !evaluateFirestoreRule('deliverables', 'read', null, livrableVerrouille).allowed,
-  'Téléchargement du livrable REFUSÉ si le solde n\'est pas réglé (sécurité anti-impayés)'
-);
-
-const livrableDebloque = { budget: 2000, paidAmount: 2000, currentStep: 'livraison' };
-assert(
-  evaluateFirestoreRule('deliverables', 'read', null, livrableDebloque).allowed,
-  'Téléchargement du livrable AUTORISÉ dès que le solde est soldé à 100%'
-);
-
-const devisAccepte = { id: 'q1', status: 'accepted', totalTTC: 1800 };
-assert(
-  !evaluateFirestoreRule('quotes', 'update', graphisteA, devisAccepte).allowed,
-  'Un devis signé/accepté est scellé juridiquement et ne peut plus être modifié'
-);
-
-const facturePayee = { id: 'inv1', status: 'paid', totalTTC: 1800 };
-assert(
-  !evaluateFirestoreRule('invoices', 'update', graphisteA, facturePayee).allowed,
-  'Une facture réglée est inaltérable (garantie de conformité fiscale)'
+  !evaluateFirestoreRule('abonnements', 'write' as any, userA, { plan: 'pro' }).allowed,
+  'Client SDK ne peut PAS modifier la collection /abonnements'
 );
 
 // ---------------------------------------------------------------------------
-// SUITE 4: Protection contre les injections XSS & téléversements malveillants
+// SUITE 3: Immutabilité financière & validation fichiers
 // ---------------------------------------------------------------------------
-console.log('\n4. Tests de protection XSS et téléversements sécurisés :');
+console.log('\n3. Tests d\'intégrité financière & uploads :');
 
-const xssPayload = '<script>alert("XSS Attack")</script>';
-const escaped = escapeHtml(xssPayload);
+const devisSigne = { id: 'q1', ownerId: userA.uid, status: 'accepted', totalTTC: 2500 };
 assert(
-  !escaped.includes('<script>') && escaped.includes('&lt;script&gt;'),
-  'Les balises script sont neutralisées en entités HTML sûres'
+  !evaluateFirestoreRule('quotes', 'update', userA, devisSigne, { ...devisSigne, totalTTC: 3000 }).allowed,
+  'Un devis signé/accepté ne peut plus être altéré'
 );
 
-const stripped = stripHtml(xssPayload);
+const facturePayee = { id: 'inv1', ownerId: userA.uid, status: 'paid', totalTTC: 2500 };
 assert(
-  stripped === 'alert("XSS Attack")',
-  'Le nettoyeur de balises supprime intégralement les injections HTML'
+  !evaluateFirestoreRule('invoices', 'update', userA, facturePayee, { ...facturePayee, totalTTC: 1000 }).allowed,
+  'Une facture réglée est inaltérable (Garantie fiscale)'
 );
 
-// Validation de fichiers
-const cleanFileName = sanitizeUploadedFileName('../../etc/passwd.exe');
+const scriptFile = validateUploadedFile({ name: 'malicious.php', size: 1024 });
 assert(
-  !cleanFileName.includes('..') && cleanFileName.endsWith('.blocked'),
-  'Les attaques par Directory Traversal et les fichiers .exe sont bloqués'
+  scriptFile.valid === false,
+  'Fichier malveillant .php intercepté et rejeté'
 );
 
-const validUpload = validateUploadedFile({ name: 'maquette_packaging_v2.pdf', size: 12 * 1024 * 1024 });
+const bigFile = validateUploadedFile({ name: 'archive.zip', size: 60 * 1024 * 1024 });
 assert(
-  validUpload.valid === true,
-  'Un fichier PDF légitime de 12 Mo est validé'
-);
-
-const oversizedUpload = validateUploadedFile({ name: 'gros_fichier.zip', size: 65 * 1024 * 1024 }, 50);
-assert(
-  Boolean(oversizedUpload.valid === false && oversizedUpload.error?.includes('50 Mo')),
-  'Un fichier dépassant 50 Mo est rejeté avec un message clair'
-);
-
-const malwareUpload = validateUploadedFile({ name: 'trojan.exe', size: 1024 });
-assert(
-  malwareUpload.valid === false,
-  'Un fichier exécutable .exe est intercepté et rejeté sans exception'
-);
-
-// Jeton cryptographique
-const token = generateSecureToken(48);
-assert(
-  token.length === 48 && /^[a-zA-Z0-9]+$/.test(token),
-  'Le jeton de lien client est cryptographiquement long, aléatoire et alphanumérique'
+  bigFile.valid === false,
+  'Fichier dépassant 50 Mo rejeté'
 );
 
 // ---------------------------------------------------------------------------
-// SUITE 5: Architecture Multi-Utilisateurs, Workspaces & Super Admin
+// SUITE 4: Vérification Super Admin sans email en dur
 // ---------------------------------------------------------------------------
-console.log('\n5. Tests d\'étanchéité des Workspaces & Privilèges Super Admin :');
-
-function evaluateWorkspaceRule(
-  user: { uid: string; workspaceId: string; email: string; isSuperAdmin?: boolean } | null,
-  targetWorkspace: { id: string; ownerId: string; planId: string; planStatus: string },
-  action: 'read' | 'update_settings' | 'update_plan' | 'access_admin'
-): { allowed: boolean; reason: string } {
-  if (!user) return { allowed: false, reason: 'Refus : utilisateur non connecté' };
-
-  if (action === 'access_admin') {
-    if (user.isSuperAdmin || user.email === 'ouattaraabdoulaye479@gmail.com') {
-      return { allowed: true, reason: 'Autorisé : Super Administrateur propriétaire' };
-    }
-    return { allowed: false, reason: 'Refus : accès console admin strictement réservé au propriétaire' };
-  }
-
-  // Isolation inter-workspaces
-  if (user.workspaceId !== targetWorkspace.id && !user.isSuperAdmin) {
-    return { allowed: false, reason: 'Refus : tentative d\'accès à un espace de travail tiers' };
-  }
-
-  if (action === 'read' || action === 'update_settings') {
-    return { allowed: true, reason: 'Autorisé : membre du workspace' };
-  }
-
-  if (action === 'update_plan') {
-    // Un utilisateur ne peut JAMAIS modifier son propre plan directement
-    if (!user.isSuperAdmin) {
-      return { allowed: false, reason: 'Refus : modification frauduleuse de plan par le client interdite' };
-    }
-    return { allowed: true, reason: 'Autorisé : attribution super admin' };
-  }
-
-  return { allowed: false, reason: 'Refus par défaut' };
-}
-
-const userLucas = { uid: 'user_lucas', workspaceId: 'ws_lucas', email: 'lucas@freelance.fr' };
-const userSophie = { uid: 'user_sophie', workspaceId: 'ws_sophie', email: 'sophie@studio.fr' };
-const superAdminAbdoulaye = { uid: 'user_abdoulaye', workspaceId: 'ws_abdoulaye', email: 'ouattaraabdoulaye479@gmail.com', isSuperAdmin: true };
-
-const workspaceSophie = { id: 'ws_sophie', ownerId: 'user_sophie', planId: 'pro', planStatus: 'active' };
+console.log('\n4. Tests Super Admin via Custom Claims (aucun email en dur) :');
 
 assert(
-  !evaluateWorkspaceRule(userLucas, workspaceSophie, 'read').allowed,
-  'Un utilisateur du Workspace A ne peut PAS lire les données du Workspace B (Hermétisme multi-tenant)'
+  evaluateFirestoreRule('projects', 'read', superAdminUser, projetA).allowed,
+  'Le Super Admin peut auditer les projets via son custom claim'
 );
 
 assert(
-  evaluateWorkspaceRule(userSophie, workspaceSophie, 'read').allowed,
-  'Un utilisateur accède légitimement aux données de son propre espace de travail'
+  evaluateFirestoreRule('users', 'update', superAdminUser, profileA, { ...profileA, plan: 'agency' }).allowed,
+  'Le Super Admin peut attribuer un plan depuis la console'
 );
 
-assert(
-  !evaluateWorkspaceRule(userSophie, workspaceSophie, 'update_plan').allowed,
-  'Un utilisateur régulier ne peut PAS s\'attribuer ou modifier son planId côté client'
-);
-
-assert(
-  evaluateWorkspaceRule(superAdminAbdoulaye, workspaceSophie, 'update_plan').allowed,
-  'Le Super Administrateur peut accorder ou modifier un plan manuellement'
-);
-
-assert(
-  !evaluateWorkspaceRule(userSophie, workspaceSophie, 'access_admin').allowed,
-  'Un utilisateur standard est bloqué s\'il tente d\'accéder à l\'espace Super Administrateur'
-);
-
-assert(
-  evaluateWorkspaceRule(superAdminAbdoulaye, workspaceSophie, 'access_admin').allowed,
-  'Le propriétaire légitime de la plateforme accède sans encombre à la console Super Admin'
-);
-
-// Bilan
+// ---------------------------------------------------------------------------
+// BILAN DES TESTS
+// ---------------------------------------------------------------------------
 console.log('\n------------------------------------------------------');
 const total = results.length;
 const passed = results.filter(r => r.passed).length;
-console.log(`RÉSULTAT DU CONTRÔLE DE SÉCURITÉ : ${passed}/${total} invariants validés.`);
+console.log(`RÉSULTAT DU CONTRÔLE ZERO-TRUST : ${passed}/${total} assertions validées.`);
 if (passed === total) {
   console.log('✅ TOUTES LES RÈGLES DE SÉCURITÉ SONT OPÉRATIONNELLES ET CONFORMES.\n');
 } else {

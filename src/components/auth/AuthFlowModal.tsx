@@ -23,7 +23,7 @@ import {
   TERMS_CURRENT_VERSION 
 } from '../../utils/authSecurity';
 import { LegalModal, LegalDocType } from '../legal/LegalModal';
-import { GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
+import { GoogleAuthProvider, signInWithPopup, sendPasswordResetEmail } from 'firebase/auth';
 import { auth as firebaseAuth } from '../../config/firebase';
 
 export type AuthMode = 'login' | 'register' | 'verify_email' | 'google_terms' | 'reset_password' | 'link_account' | 'google_select_account';
@@ -224,7 +224,7 @@ export const AuthFlowModal: React.FC<AuthFlowModalProps> = ({
     }
   };
 
-  const handleRequestResetCode = async (e?: React.FormEvent) => {
+  const handleRequestPasswordReset = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const cleanEmail = email.trim().toLowerCase();
     if (!cleanEmail || !cleanEmail.includes('@')) {
@@ -236,102 +236,20 @@ export const AuthFlowModal: React.FC<AuthFlowModalProps> = ({
     setInfoMessage('');
 
     try {
-      const res = await fetch('/api/auth/send-reset-code', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: cleanEmail })
-      });
-      const data = await res.json();
+      await sendPasswordResetEmail(firebaseAuth, cleanEmail);
       setIsLoading(false);
-      if (res.ok && data.success) {
-        setInfoMessage(`Un code de vérification à 6 chiffres a été envoyé à ${cleanEmail}.`);
-        setResetStep('verify_code');
-        setResetCooldown(data.cooldownSeconds || 60);
+      setInfoMessage(`Un email officiel de réinitialisation de mot de passe a été envoyé par Firebase à l'adresse ${cleanEmail}. Cliquez sur le lien reçu pour définir votre nouveau mot de passe.`);
+      setResetStep('success');
+    } catch (err: any) {
+      setIsLoading(false);
+      const code = err?.code;
+      if (code === 'auth/user-not-found') {
+        setErrorMessage("Aucun compte n'a été trouvé avec cette adresse email.");
+      } else if (code === 'auth/invalid-email') {
+        setErrorMessage("L'adresse email renseignée n'est pas valide.");
       } else {
-        setErrorMessage(data.message || data.error || "Impossible d'envoyer le code de réinitialisation.");
+        setErrorMessage(err?.message || "Impossible d'envoyer l'email de réinitialisation de mot de passe.");
       }
-    } catch {
-      setIsLoading(false);
-      setErrorMessage("Erreur de connexion avec le serveur.");
-    }
-  };
-
-  const handleVerifyResetCode = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const cleanEmail = email.trim().toLowerCase();
-    const cleanCode = resetCode.trim();
-    if (!cleanCode || cleanCode.length !== 6) {
-      setErrorMessage('Veuillez saisir le code à 6 chiffres reçu par email.');
-      return;
-    }
-    setIsLoading(true);
-    setErrorMessage('');
-    setInfoMessage('');
-
-    try {
-      const res = await fetch('/api/auth/verify-reset-code', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: cleanEmail, code: cleanCode })
-      });
-      const data = await res.json();
-      setIsLoading(false);
-      if (res.ok && data.success) {
-        setInfoMessage('Code vérifié avec succès. Définissez à présent votre nouveau mot de passe.');
-        setResetStep('new_password');
-      } else {
-        setErrorMessage(data.error || 'Code invalide ou expiré.');
-      }
-    } catch {
-      setIsLoading(false);
-      setErrorMessage("Erreur de connexion avec le serveur.");
-    }
-  };
-
-  const handleResetPasswordSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const cleanEmail = email.trim().toLowerCase();
-    const cleanCode = resetCode.trim();
-
-    if (newPassword.length < 10) {
-      setErrorMessage('Le nouveau mot de passe doit comporter au moins 10 caractères.');
-      return;
-    }
-    if (newPassword !== confirmNewPassword) {
-      setErrorMessage('Les deux mots de passe ne correspondent pas.');
-      return;
-    }
-
-    setIsLoading(true);
-    setErrorMessage('');
-    setInfoMessage('');
-
-    try {
-      const res = await fetch('/api/auth/reset-password', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: cleanEmail,
-          code: cleanCode,
-          newPassword
-        })
-      });
-      const data = await res.json();
-      setIsLoading(false);
-      if (res.ok && data.success) {
-        setResetStep('success');
-        setInfoMessage('Votre mot de passe a été réinitialisé avec succès !');
-        // Connexion automatique avec le nouveau mot de passe
-        await loginWithEmail(cleanEmail, newPassword);
-        setTimeout(() => {
-          onSuccess();
-        }, 1500);
-      } else {
-        setErrorMessage(data.error || 'Échec de la réinitialisation du mot de passe.');
-      }
-    } catch {
-      setIsLoading(false);
-      setErrorMessage("Erreur de connexion avec le serveur.");
     }
   };
 
@@ -831,14 +749,14 @@ export const AuthFlowModal: React.FC<AuthFlowModalProps> = ({
           {mode === 'reset_password' && (
             <div className="space-y-4">
               {resetStep === 'request_code' && (
-                <form onSubmit={handleRequestResetCode} className="space-y-4">
+                <form onSubmit={handleRequestPasswordReset} className="space-y-4">
                   <div className="p-3.5 rounded-2xl bg-white/5 border border-white/10 text-xs text-[#8a7968] space-y-1">
                     <p className="font-semibold text-[#eeebd3] flex items-center gap-1.5">
                       <KeyRound className="w-4 h-4 text-[#f7c548]" />
-                      <span>Récupération de compte</span>
+                      <span>Récupération de compte Firebase</span>
                     </p>
                     <p>
-                      Entrez votre adresse email de connexion. Un code de sécurité temporaire à 6 chiffres vous sera envoyé par email pour valider votre identité.
+                      Entrez votre adresse email de connexion. Firebase Authentication vous enverra directement un email sécurisé contenant le lien officiel pour réinitialiser votre mot de passe.
                     </p>
                   </div>
 
@@ -864,7 +782,7 @@ export const AuthFlowModal: React.FC<AuthFlowModalProps> = ({
                     disabled={isLoading || !email.includes('@')}
                     className="w-full py-3 px-4 rounded-xl text-xs font-bold text-[#0f0326] bg-[#f7c548] hover:bg-[#e5b336] disabled:opacity-40 transition-all cursor-pointer shadow-lg shadow-[#f7c548]/20 flex items-center justify-center gap-2"
                   >
-                    <span>{isLoading ? 'Envoi du code...' : 'Recevoir le code de vérification'}</span>
+                    <span>{isLoading ? 'Envoi en cours...' : 'Envoyer le lien de réinitialisation'}</span>
                     <ArrowRight className="w-3.5 h-3.5" />
                   </button>
 
@@ -874,139 +792,32 @@ export const AuthFlowModal: React.FC<AuthFlowModalProps> = ({
                       setMode('login');
                       setResetStep('request_code');
                     }}
-                    className="w-full text-center text-xs text-[#8a7968] hover:text-[#eeebd3] transition-colors"
+                    className="w-full text-center text-xs text-[#8a7968] hover:text-[#eeebd3] transition-colors cursor-pointer"
                   >
                     Retour à la connexion
                   </button>
                 </form>
               )}
 
-              {resetStep === 'verify_code' && (
-                <form onSubmit={handleVerifyResetCode} className="space-y-4">
-                  <div className="p-3.5 rounded-2xl bg-white/5 border border-white/10 text-xs text-[#8a7968] space-y-1">
-                    <p className="font-semibold text-[#eeebd3] flex items-center gap-1.5">
-                      <Mail className="w-4 h-4 text-[#f7c548]" />
-                      <span>Code transmis par email</span>
-                    </p>
-                    <p>
-                      Un code à 6 chiffres a été envoyé à <strong className="text-[#eeebd3]">{email}</strong>. Saisissez-le ci-dessous.
-                    </p>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-medium text-[#8a7968] mb-1">
-                      Code de vérification (6 chiffres)
-                    </label>
-                    <input
-                      type="text"
-                      maxLength={6}
-                      required
-                      value={resetCode}
-                      onChange={(e) => setResetCode(e.target.value.replace(/\D/g, ''))}
-                      placeholder="123456"
-                      className="w-full px-3.5 py-2.5 text-center text-lg font-mono tracking-widest font-bold glass-input"
-                    />
-                  </div>
-
-                  <button
-                    type="submit"
-                    disabled={isLoading || resetCode.length !== 6}
-                    className="w-full py-3 px-4 rounded-xl text-xs font-bold text-[#0f0326] bg-[#f7c548] hover:bg-[#e5b336] disabled:opacity-40 transition-all cursor-pointer shadow-lg shadow-[#f7c548]/20 flex items-center justify-center gap-2"
-                  >
-                    <span>{isLoading ? 'Vérification...' : 'Valider le code'}</span>
-                    <Check className="w-3.5 h-3.5" />
-                  </button>
-
-                  <div className="flex items-center justify-between pt-1">
-                    <button
-                      type="button"
-                      disabled={resetCooldown > 0 || isLoading}
-                      onClick={() => handleRequestResetCode()}
-                      className="text-xs text-[#f7c548] hover:underline disabled:opacity-40 cursor-pointer"
-                    >
-                      {resetCooldown > 0 ? `Renvoyer le code (${resetCooldown}s)` : 'Renvoyer un code'}
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => setResetStep('request_code')}
-                      className="text-xs text-[#8a7968] hover:text-[#eeebd3]"
-                    >
-                      Changer d'email
-                    </button>
-                  </div>
-                </form>
-              )}
-
-              {resetStep === 'new_password' && (
-                <form onSubmit={handleResetPasswordSubmit} className="space-y-4">
-                  <div className="p-3.5 rounded-2xl bg-white/5 border border-white/10 text-xs text-[#8a7968] space-y-1">
-                    <p className="font-semibold text-[#eeebd3] flex items-center gap-1.5">
-                      <Lock className="w-4 h-4 text-[#f7c548]" />
-                      <span>Nouveau mot de passe</span>
-                    </p>
-                    <p>
-                      Choisissez un mot de passe sécurisé d'au moins 10 caractères.
-                    </p>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-medium text-[#8a7968] mb-1">
-                      Nouveau mot de passe
-                    </label>
-                    <div className="relative">
-                      <input
-                        type={showNewPassword ? 'text' : 'password'}
-                        required
-                        value={newPassword}
-                        onChange={(e) => setNewPassword(e.target.value)}
-                        placeholder="••••••••••••"
-                        className="w-full pl-3.5 pr-10 py-2.5 text-xs glass-input"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setShowNewPassword(!showNewPassword)}
-                        className="absolute right-3 top-1/2 -translate-y-1/2 text-[#8a7968] hover:text-[#eeebd3]"
-                      >
-                        {showNewPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-medium text-[#8a7968] mb-1">
-                      Confirmer le nouveau mot de passe
-                    </label>
-                    <input
-                      type={showNewPassword ? 'text' : 'password'}
-                      required
-                      value={confirmNewPassword}
-                      onChange={(e) => setConfirmNewPassword(e.target.value)}
-                      placeholder="••••••••••••"
-                      className="w-full px-3.5 py-2.5 text-xs glass-input"
-                    />
-                  </div>
-
-                  <button
-                    type="submit"
-                    disabled={isLoading || newPassword.length < 10 || newPassword !== confirmNewPassword}
-                    className="w-full py-3 px-4 rounded-xl text-xs font-bold text-[#0f0326] bg-[#f7c548] hover:bg-[#e5b336] disabled:opacity-40 transition-all cursor-pointer shadow-lg shadow-[#f7c548]/20 flex items-center justify-center gap-2"
-                  >
-                    <span>{isLoading ? 'Mise à jour en cours...' : 'Mettre à jour le mot de passe & se connecter'}</span>
-                    <ArrowRight className="w-3.5 h-3.5" />
-                  </button>
-                </form>
-              )}
-
               {resetStep === 'success' && (
-                <div className="text-center py-6 space-y-3">
-                  <div className="w-12 h-12 rounded-full bg-[#f7c548]/20 border border-[#f7c548] text-[#f7c548] flex items-center justify-center mx-auto">
+                <div className="text-center py-6 space-y-4">
+                  <div className="w-12 h-12 rounded-full bg-[#5FB59A]/20 border border-[#5FB59A] text-[#5FB59A] flex items-center justify-center mx-auto">
                     <Check className="w-6 h-6" />
                   </div>
-                  <h3 className="text-sm font-bold text-[#eeebd3]">Mot de passe réinitialisé</h3>
-                  <p className="text-xs text-[#8a7968]">
-                    Votre mot de passe a été mis à jour. Connexion automatique à votre espace en cours...
+                  <h3 className="text-sm font-bold text-[#eeebd3]">Email envoyé avec succès</h3>
+                  <p className="text-xs text-[#8a7968] leading-relaxed">
+                    Un lien sécurisé de réinitialisation a été envoyé à <strong className="text-[#eeebd3]">{email}</strong> via Firebase Authentication. Veuillez consulter votre boîte de réception et vos courriers indésirables.
                   </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMode('login');
+                      setResetStep('request_code');
+                    }}
+                    className="w-full py-2.5 px-4 rounded-xl text-xs font-bold text-[#0f0326] bg-[#f7c548] hover:bg-[#e5b336] transition-all cursor-pointer"
+                  >
+                    Retour à la connexion
+                  </button>
                 </div>
               )}
             </div>

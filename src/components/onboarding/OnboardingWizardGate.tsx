@@ -144,7 +144,7 @@ export const OnboardingWizardGate: React.FC = () => {
     }
   };
 
-  const accentPresets = ['#f7c548', '#5FB59A', '#6C82E8', '#f7c548', '#D9695F', '#9B51E0'];
+  const accentPresets = ['#f7c548', '#5FB59A', '#6C82E8', '#38BDF8', '#D9695F', '#9B51E0'];
 
   return (
     <div className="min-h-screen py-10 px-4 flex flex-col items-center justify-center relative z-10 animate-fadeIn">
@@ -302,9 +302,9 @@ export const OnboardingWizardGate: React.FC = () => {
                 Couleur d’accent du studio
               </label>
               <div className="flex items-center gap-3">
-                {accentPresets.map(color => (
+                {accentPresets.map((color, idx) => (
                   <button
-                    key={color}
+                    key={`${color}-${idx}`}
                     type="button"
                     onClick={() => setFormData({ ...formData, accentColor: color })}
                     style={{ backgroundColor: color }}

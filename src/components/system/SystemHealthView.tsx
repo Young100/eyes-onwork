@@ -35,6 +35,17 @@ interface SystemHealthData {
     rssMb: string;
     heapUsedMb: string;
   };
+  firestoreAdmin?: {
+    status: 'connected' | 'error';
+    testedAt: string;
+    writeSuccess: boolean;
+    writeLatencyMs: number;
+    readSuccess: boolean;
+    readLatencyMs: number;
+    cleanupSuccess: boolean;
+    error?: string;
+    probeDoc: string;
+  };
   recentErrorsCount: number;
 }
 
@@ -53,6 +64,8 @@ export const SystemHealthView: React.FC = () => {
   const [errors, setErrors] = useState<ServerErrorItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [lastCheck, setLastCheck] = useState<Date>(new Date());
+
+  const [isTestingProbe, setIsTestingProbe] = useState(false);
 
   const fetchHealthAndErrors = async () => {
     setIsLoading(true);
@@ -75,6 +88,20 @@ export const SystemHealthView: React.FC = () => {
       console.warn('[SystemHealth] Erreur de chargement:', err);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleTestFirestoreProbe = async () => {
+    setIsTestingProbe(true);
+    try {
+      const res = await fetch('/api/system/test-firestore', { method: 'POST' });
+      if (res.ok) {
+        await fetchHealthAndErrors();
+      }
+    } catch (err) {
+      console.warn('[SystemHealth] Probe test error:', err);
+    } finally {
+      setIsTestingProbe(false);
     }
   };
 
@@ -209,6 +236,73 @@ export const SystemHealthView: React.FC = () => {
             <span className="text-white font-mono">{health?.memory.heapUsedMb || '0'} Mo</span>
           </div>
         </div>
+      </div>
+
+      {/* Firestore Admin SDK Diagnostic Probe (Write & Read Test) */}
+      <div className="glass-panel p-5 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-white/10">
+          <div className="flex items-center gap-2">
+            <span className="p-1 rounded-lg bg-[#f7c548]/10 text-[#f7c548]">
+              <HardDrive className="w-4 h-4" />
+            </span>
+            <div>
+              <h2 className="text-xs font-semibold uppercase tracking-wider text-white font-display">
+                Accès Firestore Admin (SDK Serveur) — Sonde Diagnostic
+              </h2>
+              <p className="text-[11px] text-[#8E97AB]">
+                Test réel d'écriture puis de lecture côté serveur sur le projet Firebase personnel
+              </p>
+            </div>
+          </div>
+
+          <button
+            onClick={handleTestFirestoreProbe}
+            disabled={isTestingProbe}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-[#f7c548]/10 text-[#f7c548] border border-[#f7c548]/30 hover:bg-[#f7c548]/20 transition-colors disabled:opacity-50 self-start sm:self-auto cursor-pointer"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isTestingProbe ? 'animate-spin' : ''}`} />
+            <span>{isTestingProbe ? 'Test en cours...' : 'Tester Écriture & Lecture'}</span>
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+          <div className="p-3 rounded-xl bg-white/[0.02] border border-white/5 space-y-1">
+            <span className="text-[10px] text-[#8E97AB] uppercase font-semibold">Statut Sonde</span>
+            <div className="flex items-center gap-2">
+              <span className={`w-2 h-2 rounded-full ${health?.firestoreAdmin?.status === 'connected' ? 'bg-[#5FB59A] animate-pulse' : 'bg-[#D9695F]'}`} />
+              <span className={`font-semibold ${health?.firestoreAdmin?.status === 'connected' ? 'text-[#5FB59A]' : 'text-[#D9695F]'}`}>
+                {health?.firestoreAdmin?.status === 'connected' ? 'Connecté & Opérationnel' : 'Erreur de connexion'}
+              </span>
+            </div>
+          </div>
+
+          <div className="p-3 rounded-xl bg-white/[0.02] border border-white/5 space-y-1">
+            <span className="text-[10px] text-[#8E97AB] uppercase font-semibold">Latence d'écriture</span>
+            <div className="text-sm font-bold text-white font-mono">
+              {health?.firestoreAdmin?.writeLatencyMs !== undefined ? `${health.firestoreAdmin.writeLatencyMs} ms` : 'N/A'}
+            </div>
+          </div>
+
+          <div className="p-3 rounded-xl bg-white/[0.02] border border-white/5 space-y-1">
+            <span className="text-[10px] text-[#8E97AB] uppercase font-semibold">Latence de lecture</span>
+            <div className="text-sm font-bold text-white font-mono">
+              {health?.firestoreAdmin?.readLatencyMs !== undefined ? `${health.firestoreAdmin.readLatencyMs} ms` : 'N/A'}
+            </div>
+          </div>
+
+          <div className="p-3 rounded-xl bg-white/[0.02] border border-white/5 space-y-1">
+            <span className="text-[10px] text-[#8E97AB] uppercase font-semibold">Dernier test</span>
+            <div className="text-xs text-[#8E97AB] font-mono truncate">
+              {health?.firestoreAdmin?.testedAt ? new Date(health.firestoreAdmin.testedAt).toLocaleTimeString('fr-FR') : 'Au démarrage'}
+            </div>
+          </div>
+        </div>
+
+        {health?.firestoreAdmin?.error && (
+          <div className="p-3 rounded-xl bg-[#D9695F]/10 border border-[#D9695F]/30 text-xs text-[#ff9999] font-mono break-all">
+            <strong>Erreur signalée :</strong> {health.firestoreAdmin.error}
+          </div>
+        )}
       </div>
 
       {/* Security Checklist Details */}

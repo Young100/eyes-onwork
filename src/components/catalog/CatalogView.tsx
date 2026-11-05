@@ -29,8 +29,8 @@ export const CatalogView: React.FC<CatalogViewProps> = ({ onUseTemplateForProjec
   });
 
   const filteredServices = catalogServices.filter(s => {
-    const matchesSearch = s.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      s.deliverableDescription.toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesSearch = (s.name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (s.deliverableDescription || '').toLowerCase().includes(searchQuery.toLowerCase());
     const matchesCat = categoryFilter === 'all' || s.category === categoryFilter;
     return matchesSearch && matchesCat && s.status === 'active';
   });
@@ -98,7 +98,7 @@ export const CatalogView: React.FC<CatalogViewProps> = ({ onUseTemplateForProjec
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h2 className="font-display font-bold text-2xl text-white">Catalogue de Prestations & Packs</h2>
+          <h2 className="font-display font-bold text-2xl text-[var(--text-primary)]">Catalogue de Prestations & Packs</h2>
           <p className="text-xs text-[#8E97AB]">Répertoire de vos tarifs types. À l'ajout dans un projet, le tarif est copié et sanctuarisé.</p>
         </div>
 
@@ -190,7 +190,7 @@ export const CatalogView: React.FC<CatalogViewProps> = ({ onUseTemplateForProjec
                 </div>
               </div>
 
-              <h3 className="font-bold text-white text-base leading-snug">{service.name}</h3>
+              <h3 className="font-bold text-[var(--text-primary)] text-base leading-snug">{service.name}</h3>
               <p className="text-xs text-[#8E97AB] line-clamp-3 leading-relaxed">{service.deliverableDescription}</p>
             </div>
 

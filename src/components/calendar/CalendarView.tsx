@@ -114,7 +114,7 @@ export const CalendarView: React.FC = () => {
             <span className="p-2 rounded-xl bg-[#f7c548]/20 text-[#f7c548]">
               <CalendarIcon className="w-5 h-5" />
             </span>
-            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-white font-display">
+            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-[var(--text-primary)] font-display">
               Calendrier & Planning
             </h1>
           </div>
@@ -148,7 +148,7 @@ export const CalendarView: React.FC = () => {
         <div className="space-y-1">
           <div className="flex items-center gap-2">
             <Clock className="w-4 h-4 text-[#f7c548]" />
-            <h3 className="text-xs font-bold uppercase tracking-wider text-white font-display">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-[var(--text-primary)] font-display">
               Charge de travail & Échéances de la semaine
             </h3>
           </div>
@@ -176,16 +176,16 @@ export const CalendarView: React.FC = () => {
           <div className="flex items-center gap-2">
             <button
               onClick={handlePrevMonth}
-              className="p-1.5 rounded-lg text-[#8E97AB] hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+              className="p-1.5 rounded-lg text-[#8E97AB] hover:text-[var(--text-primary)] hover:bg-white/10 transition-colors cursor-pointer"
             >
               <ChevronLeft className="w-4 h-4" />
             </button>
-            <span className="text-sm sm:text-base font-bold text-white capitalize font-display min-w-36 text-center">
+            <span className="text-sm sm:text-base font-bold text-[var(--text-primary)] capitalize font-display min-w-36 text-center">
               {monthName}
             </span>
             <button
               onClick={handleNextMonth}
-              className="p-1.5 rounded-lg text-[#8E97AB] hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+              className="p-1.5 rounded-lg text-[#8E97AB] hover:text-[var(--text-primary)] hover:bg-white/10 transition-colors cursor-pointer"
             >
               <ChevronRight className="w-4 h-4" />
             </button>
@@ -231,11 +231,11 @@ export const CalendarView: React.FC = () => {
                 key={idx}
                 className={`
                   min-h-24 sm:min-h-28 p-1.5 sm:p-2 rounded-xl border flex flex-col justify-between transition-colors
-                  ${item.isCurrentMonth ? 'bg-white/[0.02] border-white/10 text-white' : 'bg-transparent border-white/5 text-white/30'}
+                  ${item.isCurrentMonth ? 'bg-[var(--card-surface-elevated)] border-[var(--border-subtle)] text-[var(--text-primary)]' : 'bg-transparent border-[var(--border-subtle)]/40 text-[var(--text-secondary)]/50'}
                 `}
               >
                 <div className="flex items-center justify-between text-xs">
-                  <span className={`font-semibold font-display ${item.isCurrentMonth ? 'text-white' : 'text-white/30'}`}>
+                  <span className={`font-semibold font-display ${item.isCurrentMonth ? 'text-[var(--text-primary)]' : 'text-[var(--text-secondary)]/50'}`}>
                     {item.day}
                   </span>
                 </div>

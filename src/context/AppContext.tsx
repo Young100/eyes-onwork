@@ -1,7 +1,14 @@
 import React, { createContext, useContext, useEffect, useState, useMemo } from 'react';
 import { CURRENT_TERMS_VERSION, CURRENT_PRIVACY_VERSION } from '../config/termsConfig';
 import { db, auth as firebaseAuth } from '../config/firebase';
-import { signOut } from 'firebase/auth';
+import { 
+  signOut,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  signInWithCustomToken,
+  onAuthStateChanged,
+  updateProfile as updateFirebaseProfile
+} from 'firebase/auth';
 import { 
   collection as firestoreCol, 
   doc as firestoreDoc, 
@@ -356,7 +363,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [allWorkspaces, setAllWorkspaces] = useState<Workspace[]>(() => {
     const saved = localStorage.getItem(STORAGE_KEYS.WORKSPACES);
     if (saved) {
-      try { return JSON.parse(saved); } catch {}
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) {
+          return parsed.map((w: Workspace) => ({
+            ...w,
+            ownerEmail: w.ownerEmail || (w.id === 'ws_default' ? 'contact@atelierparis.fr' : '')
+          }));
+        }
+      } catch {}
     }
     return INITIAL_DEMO_WORKSPACES;
   });
@@ -403,7 +418,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           const isSuper = isSuperAdminUser(parsed.email);
           return {
             ...parsed,
-            workspaceId: parsed.workspaceId || 'ws_abdoulaye',
+            workspaceId: parsed.workspaceId || (isSuper ? 'ws_abdoulaye' : 'ws_default'),
             role: parsed.role || (isSuper ? 'superadmin' : 'owner'),
             isSuperAdmin: parsed.isSuperAdmin !== undefined ? parsed.isSuperAdmin : isSuper
           };
@@ -456,7 +471,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       emailVerified: true,
       provider: 'password',
       linkedProviders: ['password'],
-      workspaceId: 'ws_abdoulaye',
+      workspaceId: 'ws_default',
       role: 'owner',
       isSuperAdmin: false,
       termsAcceptedVersion: CURRENT_TERMS_VERSION,
@@ -471,32 +486,53 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (cleanEmail.length > 3 && pass.length >= 4) {
       setIsAuthLoading(true);
       try {
-        const loginRes = await fetch('/api/auth/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            email: cleanEmail,
-            password: pass
-          })
-        });
-        const loginData = await loginRes.json();
-        if (!loginRes.ok || !loginData.success) {
+        let firebaseUser: any = null;
+        try {
+          const cred = await signInWithEmailAndPassword(firebaseAuth, cleanEmail, pass);
+          firebaseUser = cred.user;
+        } catch (authErr: any) {
           setIsAuthLoading(false);
           return false;
         }
 
-        const serverUser = loginData.profile;
+        if (!firebaseUser) {
+          setIsAuthLoading(false);
+          return false;
+        }
+
+        let idToken = '';
+        try {
+          idToken = await firebaseUser.getIdToken();
+        } catch {}
+
+        let serverUser: any = null;
+        if (idToken) {
+          try {
+            const profileRes = await fetch('/api/user/profile', {
+              headers: { 'Authorization': `Bearer ${idToken}` }
+            });
+            const text = await profileRes.text();
+            const pData = text ? JSON.parse(text) : null;
+            if (profileRes.ok && pData?.profile) {
+              serverUser = pData.profile;
+            }
+          } catch {}
+        }
+
         const isSuper = isSuperAdminUser(cleanEmail) || serverUser?.role === 'superadmin';
-        const existingWs = allWorkspaces.find(w => w.ownerEmail.toLowerCase() === cleanEmail);
+        const existingWs = allWorkspaces.find(w => 
+          (w.ownerEmail && w.ownerEmail.toLowerCase() === cleanEmail) || 
+          (Array.isArray(w.members) && w.members.some(m => m.email && m.email.toLowerCase() === cleanEmail))
+        );
         const wsId = serverUser?.workspaceId || (existingWs ? existingWs.id : `ws_${cleanEmail.replace(/[^a-z0-9]/gi, '_')}`);
-        const isVerified = isSuper || Boolean(serverUser?.emailVerified);
+        const isVerified = isSuper || Boolean(firebaseUser.emailVerified || serverUser?.emailVerified);
 
         // Ensure workspace is registered in allWorkspaces
         if (!allWorkspaces.some(w => w.id === wsId)) {
           const userWs: Workspace = {
             id: wsId,
             name: serverUser?.studioName || `Studio ${serverUser?.displayName || cleanEmail.split('@')[0]}`,
-            ownerId: serverUser?.uid || `user_${Date.now()}`,
+            ownerId: firebaseUser.uid,
             ownerEmail: cleanEmail,
             planId: 'free',
             planStatus: 'trial',
@@ -506,7 +542,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             trialEndsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
             storageUsedMb: 0,
             members: [{
-              userId: serverUser?.uid || `user_${Date.now()}`,
+              userId: firebaseUser.uid,
               email: cleanEmail,
               name: serverUser?.displayName || cleanEmail.split('@')[0],
               role: 'owner',
@@ -519,9 +555,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
 
         const newAuth: UserAuth = {
-          uid: serverUser?.uid || (isSuper ? 'user_abdoulaye_admin' : `user_${Date.now()}`),
+          uid: firebaseUser.uid,
           email: cleanEmail,
-          displayName: serverUser?.displayName || (isSuper ? 'Abdoulaye Ouattara' : cleanEmail.split('@')[0] || 'Graphiste'),
+          displayName: serverUser?.displayName || cleanEmail.split('@')[0] || 'Graphiste',
           isAuthenticated: true,
           emailVerified: isVerified,
           emailVerifiedAt: serverUser?.emailVerifiedAt || (isVerified ? new Date().toISOString() : null),
@@ -541,7 +577,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         };
 
         saveAuth(newAuth);
-        localStorage.setItem(`${STORAGE_KEYS.AUTH}_${cleanEmail}`, JSON.stringify(newAuth));
 
         setProfile(prev => ({
           ...prev,
@@ -711,7 +746,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Auth additions
   const registerWithEmail = async (email: string, password: string, name: string, termsVersion: string = '2026.1'): Promise<{ success: boolean; error?: string; requireVerification?: boolean }> => {
-    const cleanEmail = email.trim();
+    const cleanEmail = email.trim().toLowerCase();
     if (!cleanEmail || !cleanEmail.includes('@')) {
       return { success: false, error: 'Veuillez saisir une adresse email valide.' };
     }
@@ -719,94 +754,129 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return { success: false, error: 'Le mot de passe doit comporter au moins 10 caractères.' };
     }
     const isSuper = isSuperAdminUser(cleanEmail);
-    const newWsId = `ws_${Date.now()}`;
-    const newWs: Workspace = {
-      id: newWsId,
-      name: `Studio ${name || cleanEmail.split('@')[0]}`,
-      ownerId: `user_${Date.now()}`,
-      ownerEmail: cleanEmail,
-      planId: 'free',
-      planStatus: 'trial',
-      planBillingCycle: 'monthly',
-      planStartedAt: new Date().toISOString(),
-      planRenewsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
-      trialEndsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
-      storageUsedMb: 0,
-      members: [
-        {
-          userId: `user_${Date.now()}`,
-          email: cleanEmail,
-          name: name || cleanEmail.split('@')[0],
-          role: 'owner',
-          joinedAt: new Date().toISOString()
-        }
-      ],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
 
-    saveWorkspaces([newWs, ...allWorkspaces]);
-
-    const newAuth: UserAuth = {
-      uid: newWs.ownerId,
-      email: cleanEmail,
-      displayName: name || cleanEmail.split('@')[0],
-      isAuthenticated: true,
-      emailVerified: false,
-      provider: 'password',
-      linkedProviders: ['password'],
-      workspaceId: newWsId,
-      role: isSuper ? 'superadmin' : 'owner',
-      isSuperAdmin: isSuper,
-      termsAcceptedVersion: termsVersion,
-      termsAcceptedAt: new Date().toISOString(),
-      onboardingCompleted: false,
-      onboardingStep: 1,
-      createdAt: new Date().toISOString()
-    };
-    saveAuth(newAuth);
-    localStorage.setItem(`${STORAGE_KEYS.AUTH}_${cleanEmail.toLowerCase()}`, JSON.stringify(newAuth));
-
-    const userProfileKey = `${STORAGE_KEYS.PROFILE}_${cleanEmail.toLowerCase()}`;
-    const defaultProfile: DesignerProfile = {
-      ...INITIAL_DESIGNER_PROFILE,
-      id: newWs.ownerId,
-      name: name || cleanEmail.split('@')[0] || 'Graphiste',
-      studioName: name ? `Studio ${name}` : 'Mon Studio Graphique',
-      email: cleanEmail,
-      emailVerified: false,
-      termsAcceptedVersion: null,
-      onboardingCompleted: false,
-      onboardingStep: 1,
-      workspaceId: newWsId,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-    localStorage.setItem(userProfileKey, JSON.stringify(defaultProfile));
-    localStorage.setItem(STORAGE_KEYS.PROFILE, JSON.stringify(defaultProfile));
-    setProfile(defaultProfile);
-
-    // Enregistrement sécurisé du compte avec mot de passe sur le serveur
+    setIsAuthLoading(true);
     try {
-      const regRes = await fetch('/api/auth/register-user', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: cleanEmail,
-          password,
-          displayName: name || cleanEmail.split('@')[0],
-          studioName: defaultProfile.studioName
-        })
-      });
-      const regData = await regRes.json();
-      if (!regRes.ok || !regData.success) {
-        return { success: false, error: regData.error || 'Erreur lors de la création du compte.' };
+      let firebaseUser: any = null;
+      try {
+        const cred = await createUserWithEmailAndPassword(firebaseAuth, cleanEmail, password);
+        firebaseUser = cred.user;
+        if (name && firebaseUser) {
+          await updateFirebaseProfile(firebaseUser, { displayName: name });
+        }
+      } catch (authErr: any) {
+        setIsAuthLoading(false);
+        if (authErr?.code === 'auth/email-already-in-use') {
+          return { success: false, error: 'Un compte existe déjà avec cette adresse email.' };
+        }
+        return { success: false, error: authErr?.message || 'Erreur lors de la création du compte.' };
       }
-    } catch (regErr) {
-      console.warn('[Register] Backend registration notice:', regErr);
-    }
 
-    return { success: true, requireVerification: true };
+      if (!firebaseUser) {
+        setIsAuthLoading(false);
+        return { success: false, error: 'Erreur lors de la création du compte.' };
+      }
+
+      let idToken = '';
+      try {
+        idToken = await firebaseUser.getIdToken();
+      } catch {}
+
+      const newWsId = `ws_${firebaseUser.uid.slice(0, 8)}`;
+      const newWs: Workspace = {
+        id: newWsId,
+        name: `Studio ${name || cleanEmail.split('@')[0]}`,
+        ownerId: firebaseUser.uid,
+        ownerEmail: cleanEmail,
+        planId: 'free',
+        planStatus: 'trial',
+        planBillingCycle: 'monthly',
+        planStartedAt: new Date().toISOString(),
+        planRenewsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
+        trialEndsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
+        storageUsedMb: 0,
+        members: [
+          {
+            userId: firebaseUser.uid,
+            email: cleanEmail,
+            name: name || cleanEmail.split('@')[0],
+            role: 'owner',
+            joinedAt: new Date().toISOString()
+          }
+        ],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      saveWorkspaces([newWs, ...allWorkspaces]);
+
+      // Enregistrement sécurisé du profil et des conditions sur le serveur via Bearer Token
+      if (idToken) {
+        try {
+          await fetch('/api/user/profile', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${idToken}`
+            },
+            body: JSON.stringify({
+              displayName: name || cleanEmail.split('@')[0],
+              studioName: `Studio ${name || cleanEmail.split('@')[0]}`,
+              termsAcceptedVersion: termsVersion,
+              termsAcceptedAt: new Date().toISOString(),
+              onboardingCompleted: false
+            })
+          });
+        } catch {}
+      }
+
+      const newAuth: UserAuth = {
+        uid: firebaseUser.uid,
+        email: cleanEmail,
+        displayName: name || cleanEmail.split('@')[0],
+        isAuthenticated: true,
+        emailVerified: false,
+        provider: 'password',
+        linkedProviders: ['password'],
+        workspaceId: newWsId,
+        role: isSuper ? 'superadmin' : 'owner',
+        isSuperAdmin: isSuper,
+        termsAcceptedVersion: termsVersion,
+        termsAcceptedAt: new Date().toISOString(),
+        onboardingCompleted: false,
+        onboardingStep: 1,
+        createdAt: new Date().toISOString()
+      };
+      saveAuth(newAuth);
+
+      const defaultProfile: DesignerProfile = {
+        ...INITIAL_DESIGNER_PROFILE,
+        id: firebaseUser.uid,
+        name: name || cleanEmail.split('@')[0] || 'Graphiste',
+        studioName: name ? `Studio ${name}` : 'Mon Studio Graphique',
+        email: cleanEmail,
+        emailVerified: false,
+        termsAcceptedVersion: termsVersion,
+        onboardingCompleted: false,
+        onboardingStep: 1,
+        workspaceId: newWsId,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+      setProfile(defaultProfile);
+      setIsAuthLoading(false);
+
+      // Envoi du code de vérification par email
+      try {
+        await sendVerificationCode(cleanEmail);
+      } catch {}
+
+      return { success: true, requireVerification: true };
+    } catch (err: any) {
+      console.warn('[registerWithEmail] error:', err);
+      setIsAuthLoading(false);
+      return { success: false, error: err?.message || 'Erreur lors de la création du compte.' };
+    }
   };
 
   const loginWithGoogle = async (
@@ -823,25 +893,44 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setIsAuthLoading(true);
     try {
-      // Synchronisation avec la base de données permanente côté serveur
-      const syncRes = await fetch('/api/auth/login-sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: googleEmail,
-          provider: 'google',
-          displayName
-        })
-      });
-      const syncData = await syncRes.json();
-      const serverUser = syncData?.profile;
+      let currentFirebaseUser = firebaseAuth.currentUser;
 
-      let ws = allWorkspaces.find(w => w.ownerEmail.toLowerCase() === googleEmail);
+      // Récupération sécurisée du Bearer ID Token
+      let idToken = '';
+      if (currentFirebaseUser) {
+        try {
+          idToken = await currentFirebaseUser.getIdToken();
+        } catch {}
+      }
+
+      // Synchronisation avec le profil permanent sur Firestore via le serveur
+      let serverUser: any = null;
+      if (idToken) {
+        try {
+          const profileRes = await fetch('/api/user/profile', {
+            headers: { 'Authorization': `Bearer ${idToken}` }
+          });
+          const profileText = await profileRes.text();
+          const profileData = profileText ? JSON.parse(profileText) : null;
+          if (profileRes.ok && profileData?.success && profileData?.profile) {
+            serverUser = profileData.profile;
+          }
+        } catch (profErr) {
+          console.warn('[loginWithGoogle] Profile fetch notice:', profErr);
+        }
+      }
+
+      const uid = currentFirebaseUser?.uid || serverUser?.uid || `user_${googleEmail.replace(/[^a-z0-9]/gi, '_')}`;
+
+      let ws = allWorkspaces.find(w => 
+        (w.ownerEmail && w.ownerEmail.toLowerCase() === googleEmail) ||
+        (Array.isArray(w.members) && w.members.some(m => m.email && m.email.toLowerCase() === googleEmail))
+      );
       if (!ws) {
         ws = {
           id: serverUser?.workspaceId || `ws_${Date.now()}`,
           name: serverUser?.studioName || `Studio ${displayName}`,
-          ownerId: serverUser?.uid || `user_${Date.now()}`,
+          ownerId: uid,
           ownerEmail: googleEmail,
           planId: 'free',
           planStatus: 'trial',
@@ -851,7 +940,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           trialEndsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
           storageUsedMb: 0,
           members: [{
-            userId: serverUser?.uid || `user_${Date.now()}`,
+            userId: uid,
             email: googleEmail,
             name: displayName,
             role: 'owner',
@@ -864,10 +953,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       const newAuth: UserAuth = {
-        uid: serverUser?.uid || ws.ownerId,
+        uid,
         email: googleEmail,
         displayName: serverUser?.displayName || displayName,
-        photoURL: serverUser?.avatarUrl || '',
+        photoURL: currentFirebaseUser?.photoURL || serverUser?.avatarUrl || '',
         isAuthenticated: true,
         emailVerified: true,
         emailVerifiedAt: serverUser?.emailVerifiedAt || new Date().toISOString(),
@@ -886,11 +975,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         createdAt: serverUser?.createdAt || new Date().toISOString()
       };
       saveAuth(newAuth);
-      localStorage.setItem(`${STORAGE_KEYS.AUTH}_${googleEmail}`, JSON.stringify(newAuth));
 
       setProfile(prev => ({
         ...prev,
-        id: serverUser?.uid || ws.ownerId,
+        id: uid,
         name: serverUser?.displayName || displayName,
         studioName: serverUser?.studioName || `Studio ${displayName}`,
         email: googleEmail,
@@ -929,17 +1017,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     try {
+      let idToken = '';
+      if (firebaseAuth.currentUser) {
+        try { idToken = await firebaseAuth.currentUser.getIdToken(); } catch {}
+      }
+
       const res = await fetch('/api/auth/send-verification-code', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { 'Authorization': `Bearer ${idToken}` } : {})
+        },
         body: JSON.stringify({
           email: emailToSend,
-          userId: auth.uid,
+          userId: firebaseAuth.currentUser?.uid || auth.uid,
           studioName: profile.studioName || profile.name || 'eyes-onwork'
         })
       });
 
-      const data = await res.json();
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
       if (!res.ok || !data.success) {
         return {
           success: false,
@@ -978,13 +1075,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     try {
+      let idToken = '';
+      if (firebaseAuth.currentUser) {
+        try { idToken = await firebaseAuth.currentUser.getIdToken(); } catch {}
+      }
+
       const res = await fetch('/api/auth/verify-code', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: cleanEmail, code: cleanCode })
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { 'Authorization': `Bearer ${idToken}` } : {})
+        },
+        body: JSON.stringify({
+          email: cleanEmail,
+          code: cleanCode,
+          uid: firebaseAuth.currentUser?.uid || auth.uid
+        })
       });
 
-      const data = await res.json();
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
 
       if (res.ok && data.success) {
         const verifiedAt = data.emailVerifiedAt || data.profile?.emailVerifiedAt || new Date().toISOString();
@@ -995,10 +1105,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             emailVerifiedAt: verifiedAt
           };
           saveAuth(updatedAuth);
-          if (auth.email) {
-            localStorage.setItem(`${STORAGE_KEYS.AUTH}_${auth.email.toLowerCase()}`, JSON.stringify(updatedAuth));
-          }
-          // Marquer le profil utilisateur comme vérifié
           updateProfile({ emailVerified: true, emailVerifiedAt: verifiedAt });
         }
         return { success: true, message: data.message || 'Email vérifié avec succès.' };
@@ -1025,9 +1131,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     try {
+      let idToken = '';
+      if (firebaseAuth.currentUser) {
+        try { idToken = await firebaseAuth.currentUser.getIdToken(); } catch {}
+      }
+
       const res = await fetch('/api/auth/accept-terms', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { 'Authorization': `Bearer ${idToken}` } : {})
+        },
         body: JSON.stringify({
           email: auth.email,
           termsVersion: version,
@@ -1035,7 +1149,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         })
       });
 
-      const data = await res.json();
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
       if (!res.ok || !data.success) {
         return {
           success: false,
@@ -1043,7 +1158,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         };
       }
 
-      const updated = data.profile;
+      const updated = data.profile || {};
       const updatedAuth: UserAuth = {
         ...auth,
         termsAcceptedVersion: updated.termsAcceptedVersion || version,
@@ -1052,7 +1167,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         privacyAcceptedAt: updated.privacyAcceptedAt || new Date().toISOString()
       };
       saveAuth(updatedAuth);
-      localStorage.setItem(`${STORAGE_KEYS.AUTH}_${auth.email.toLowerCase()}`, JSON.stringify(updatedAuth));
 
       setProfile(prev => ({
         ...prev,
@@ -1077,16 +1191,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     try {
+      let idToken = '';
+      if (firebaseAuth.currentUser) {
+        try { idToken = await firebaseAuth.currentUser.getIdToken(); } catch {}
+      }
+
       const res = await fetch('/api/auth/complete-onboarding', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { 'Authorization': `Bearer ${idToken}` } : {})
+        },
         body: JSON.stringify({
           email: auth.email,
           step
         })
       });
 
-      const data = await res.json();
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
       const updated = data?.profile;
 
       const updatedAuth: UserAuth = {
@@ -1096,7 +1219,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         onboardingStep: step
       };
       saveAuth(updatedAuth);
-      localStorage.setItem(`${STORAGE_KEYS.AUTH}_${auth.email.toLowerCase()}`, JSON.stringify(updatedAuth));
 
       setProfile(prev => ({
         ...prev,
@@ -1163,23 +1285,37 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
   };
 
-  // Synchronisation avec le profil permanent sur le serveur de base de données
+  // Synchronisation avec Firebase Authentication et le profil permanent serveur
   useEffect(() => {
     let isCancelled = false;
-    if (auth.isAuthenticated && auth.email) {
-      setIsAuthLoading(true);
-      fetch(`/api/user/profile?email=${encodeURIComponent(auth.email.trim().toLowerCase())}`)
-        .then(res => res.json())
-        .then(data => {
-          if (isCancelled) return;
-          if (data && data.success && data.profile) {
+
+    const unsubscribe = onAuthStateChanged(firebaseAuth, async (firebaseUser) => {
+      if (firebaseUser && firebaseUser.email) {
+        setIsAuthLoading(true);
+        try {
+          const idToken = await firebaseUser.getIdToken();
+          const profileRes = await fetch('/api/user/profile', {
+            headers: {
+              'Authorization': `Bearer ${idToken}`
+            }
+          });
+          const text = await profileRes.text();
+          const data = text ? JSON.parse(text) : null;
+
+          if (!isCancelled && profileRes.ok && data?.success && data?.profile) {
             const serverUser = data.profile;
+            const isSuper = serverUser.role === 'superadmin' || isSuperAdminUser(firebaseUser.email);
+            const verified = Boolean(firebaseUser.emailVerified || serverUser.emailVerified);
+
             setAuth(prev => ({
               ...prev,
-              uid: serverUser.uid || prev.uid,
-              displayName: serverUser.displayName || prev.displayName,
-              emailVerified: serverUser.emailVerified ?? prev.emailVerified,
-              emailVerifiedAt: serverUser.emailVerifiedAt ?? prev.emailVerifiedAt,
+              uid: firebaseUser.uid,
+              email: firebaseUser.email || prev.email,
+              displayName: serverUser.displayName || firebaseUser.displayName || prev.displayName,
+              photoURL: firebaseUser.photoURL || prev.photoURL,
+              isAuthenticated: true,
+              emailVerified: verified,
+              emailVerifiedAt: serverUser.emailVerifiedAt || prev.emailVerifiedAt,
               termsAcceptedVersion: serverUser.termsAcceptedVersion ?? prev.termsAcceptedVersion,
               termsAcceptedAt: serverUser.termsAcceptedAt ?? prev.termsAcceptedAt,
               privacyAcceptedVersion: serverUser.privacyAcceptedVersion ?? prev.privacyAcceptedVersion,
@@ -1189,15 +1325,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               onboardingStep: serverUser.onboardingStep ?? prev.onboardingStep,
               workspaceId: serverUser.workspaceId ?? prev.workspaceId,
               role: serverUser.role ?? prev.role,
-              isSuperAdmin: serverUser.role === 'superadmin' || isSuperAdminUser(serverUser.email)
+              isSuperAdmin: isSuper
             }));
 
             setProfile(prev => ({
               ...prev,
-              name: serverUser.displayName || prev.name,
+              id: firebaseUser.uid,
+              name: serverUser.displayName || firebaseUser.displayName || prev.name,
               studioName: serverUser.studioName || prev.studioName,
-              email: serverUser.email || prev.email,
-              emailVerified: serverUser.emailVerified ?? prev.emailVerified,
+              email: firebaseUser.email || prev.email,
+              emailVerified: verified,
               emailVerifiedAt: serverUser.emailVerifiedAt ?? prev.emailVerifiedAt,
               termsAcceptedVersion: serverUser.termsAcceptedVersion ?? prev.termsAcceptedVersion,
               termsAcceptedAt: serverUser.termsAcceptedAt ?? prev.termsAcceptedAt,
@@ -1208,24 +1345,37 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               onboardingStep: serverUser.onboardingStep ?? prev.onboardingStep,
               workspaceId: serverUser.workspaceId ?? prev.workspaceId
             }));
+
+            // Synchronisation directe Firestore via le SDK client (autorisé par firestore.rules pour request.auth.uid == userId)
+            try {
+              const userRef = firestoreDoc(db, 'users', firebaseUser.uid);
+              firestoreSetDoc(userRef, {
+                uid: firebaseUser.uid,
+                email: firebaseUser.email,
+                displayName: serverUser.displayName || firebaseUser.displayName || '',
+                updatedAt: new Date().toISOString()
+              }, { merge: true }).catch(() => {});
+            } catch {}
           }
-        })
-        .catch(err => {
+        } catch (err) {
           console.warn('[Profile Sync] Failed to fetch server profile:', err);
-        })
-        .finally(() => {
+        } finally {
           if (!isCancelled) {
             setIsAuthLoading(false);
           }
-        });
-    } else {
-      setIsAuthLoading(false);
-    }
+        }
+      } else {
+        if (!isCancelled) {
+          setIsAuthLoading(false);
+        }
+      }
+    });
 
     return () => {
       isCancelled = true;
+      unsubscribe();
     };
-  }, [auth.isAuthenticated, auth.email]);
+  }, []);
 
   // Clients
   const [clients, setClients] = useState<Client[]>(() => {
@@ -1393,7 +1543,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           const fallbackCompany = p.title.split('—')[0]?.trim() || p.title.split('-')[0]?.trim() || 'Client Entreprise';
           const newClient: Client = {
             id: p.clientId,
-            workspaceId: p.workspaceId || currentWorkspace.id,
+            workspaceId: p.workspaceId || 'ws_default',
             name: fallbackCompany,
             company: fallbackCompany,
             email: `contact@${fallbackCompany.toLowerCase().replace(/[^a-z0-9]/g, '') || 'client'}.com`,
@@ -1499,7 +1649,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   ): Project => {
     const now = new Date().toISOString();
     const client = clients.find(c => c.id === data.clientId);
-    const clientPrefix = client ? client.company.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 4) : 'cli';
+    const clientPrefix = client ? ((client.company || client.name || 'cli').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 4) || 'cli') : 'cli';
     const randToken = `${clientPrefix}-${Math.random().toString(36).substring(2, 9)}-${Math.random().toString(36).substring(2, 8)}`;
     
     const lines = Array.isArray(data.lines) ? data.lines : [];
@@ -1648,7 +1798,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const regenerateShareToken = (projectId: string): string => {
     const project = projects.find(p => p.id === projectId);
     const client = project ? clients.find(c => c.id === project.clientId) : undefined;
-    const clientPrefix = client ? client.company.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 4) : 'cli';
+    const clientPrefix = client ? ((client.company || client.name || 'cli').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 4) || 'cli') : 'cli';
     const newToken = `${clientPrefix}-${Math.random().toString(36).substring(2, 9)}-${Math.random().toString(36).substring(2, 8)}`;
     
     updateProject(projectId, { clientShareToken: newToken });
@@ -3485,55 +3635,55 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Multi-tenant Workspace Scoped Business Collections
   const workspaceClients = useMemo(() => {
-    return clients.filter(c => c.workspaceId === currentWorkspace.id || (!c.workspaceId && currentWorkspace.id === 'ws_abdoulaye'));
+    return clients.filter(c => c.workspaceId === currentWorkspace.id || (!c.workspaceId && currentWorkspace.id === 'ws_default'));
   }, [clients, currentWorkspace.id]);
 
   const workspaceProjects = useMemo(() => {
-    return projects.filter(p => p.workspaceId === currentWorkspace.id || (!p.workspaceId && currentWorkspace.id === 'ws_abdoulaye'));
+    return projects.filter(p => p.workspaceId === currentWorkspace.id || (!p.workspaceId && currentWorkspace.id === 'ws_default'));
   }, [projects, currentWorkspace.id]);
 
   const workspaceQuotes = useMemo(() => {
-    return quotes.filter(q => q.workspaceId === currentWorkspace.id || (!q.workspaceId && currentWorkspace.id === 'ws_abdoulaye'));
+    return quotes.filter(q => q.workspaceId === currentWorkspace.id || (!q.workspaceId && currentWorkspace.id === 'ws_default'));
   }, [quotes, currentWorkspace.id]);
 
   const workspaceInvoices = useMemo(() => {
-    return invoices.filter(i => i.workspaceId === currentWorkspace.id || (!i.workspaceId && currentWorkspace.id === 'ws_abdoulaye'));
+    return invoices.filter(i => i.workspaceId === currentWorkspace.id || (!i.workspaceId && currentWorkspace.id === 'ws_default'));
   }, [invoices, currentWorkspace.id]);
 
   const workspaceAppointments = useMemo(() => {
-    return appointments.filter(a => a.workspaceId === currentWorkspace.id || (!a.workspaceId && currentWorkspace.id === 'ws_abdoulaye'));
+    return appointments.filter(a => a.workspaceId === currentWorkspace.id || (!a.workspaceId && currentWorkspace.id === 'ws_default'));
   }, [appointments, currentWorkspace.id]);
 
   const workspaceTimeEntries = useMemo(() => {
-    return timeEntries.filter(t => t.workspaceId === currentWorkspace.id || (!t.workspaceId && currentWorkspace.id === 'ws_abdoulaye'));
+    return timeEntries.filter(t => t.workspaceId === currentWorkspace.id || (!t.workspaceId && currentWorkspace.id === 'ws_default'));
   }, [timeEntries, currentWorkspace.id]);
 
   const workspaceExpenses = useMemo(() => {
-    return expenses.filter(e => e.workspaceId === currentWorkspace.id || (!e.workspaceId && currentWorkspace.id === 'ws_abdoulaye'));
+    return expenses.filter(e => e.workspaceId === currentWorkspace.id || (!e.workspaceId && currentWorkspace.id === 'ws_default'));
   }, [expenses, currentWorkspace.id]);
 
   const workspaceReminders = useMemo(() => {
-    return reminderQueue.filter(r => r.workspaceId === currentWorkspace.id || (!r.workspaceId && currentWorkspace.id === 'ws_abdoulaye'));
+    return reminderQueue.filter(r => r.workspaceId === currentWorkspace.id || (!r.workspaceId && currentWorkspace.id === 'ws_default'));
   }, [reminderQueue, currentWorkspace.id]);
 
   const workspaceLeads = useMemo(() => {
-    return leads.filter(l => l.workspaceId === currentWorkspace.id || (!l.workspaceId && currentWorkspace.id === 'ws_abdoulaye'));
+    return leads.filter(l => l.workspaceId === currentWorkspace.id || (!l.workspaceId && currentWorkspace.id === 'ws_default'));
   }, [leads, currentWorkspace.id]);
 
   const workspaceNotifications = useMemo(() => {
-    return notifications.filter(n => n.workspaceId === currentWorkspace.id || (!n.workspaceId && currentWorkspace.id === 'ws_abdoulaye'));
+    return notifications.filter(n => n.workspaceId === currentWorkspace.id || (!n.workspaceId && currentWorkspace.id === 'ws_default'));
   }, [notifications, currentWorkspace.id]);
 
   const workspaceCatalogServices = useMemo(() => {
-    return catalogServices.filter(s => s.workspaceId === currentWorkspace.id || (!s.workspaceId && currentWorkspace.id === 'ws_abdoulaye'));
+    return catalogServices.filter(s => s.workspaceId === currentWorkspace.id || (!s.workspaceId && currentWorkspace.id === 'ws_default'));
   }, [catalogServices, currentWorkspace.id]);
 
   const workspaceCatalogPacks = useMemo(() => {
-    return catalogPacks.filter(p => p.workspaceId === currentWorkspace.id || (!p.workspaceId && currentWorkspace.id === 'ws_abdoulaye'));
+    return catalogPacks.filter(p => p.workspaceId === currentWorkspace.id || (!p.workspaceId && currentWorkspace.id === 'ws_default'));
   }, [catalogPacks, currentWorkspace.id]);
 
   const workspaceProjectTemplates = useMemo(() => {
-    return projectTemplates.filter(t => t.workspaceId === currentWorkspace.id || (!t.workspaceId && currentWorkspace.id === 'ws_abdoulaye'));
+    return projectTemplates.filter(t => t.workspaceId === currentWorkspace.id || (!t.workspaceId && currentWorkspace.id === 'ws_default'));
   }, [projectTemplates, currentWorkspace.id]);
 
   const hasDemoData = useMemo(() => {
@@ -3555,42 +3705,42 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const deleteDemoData = () => {
     saveClients(clients.filter(c => {
-      const isInWs = c.workspaceId === currentWorkspace.id || (!c.workspaceId && currentWorkspace.id === 'ws_abdoulaye');
+      const isInWs = c.workspaceId === currentWorkspace.id || (!c.workspaceId && currentWorkspace.id === 'ws_default');
       if (isInWs) {
         return !c.isDemo && c.company !== 'Maison Solène' && c.company !== 'Café Nuance';
       }
       return true;
     }));
     saveProjects(projects.filter(p => {
-      const isInWs = p.workspaceId === currentWorkspace.id || (!p.workspaceId && currentWorkspace.id === 'ws_abdoulaye');
+      const isInWs = p.workspaceId === currentWorkspace.id || (!p.workspaceId && currentWorkspace.id === 'ws_default');
       if (isInWs) {
         return !p.isDemo && !p.title?.includes('Maison Solène') && !p.title?.includes('Café Nuance');
       }
       return true;
     }));
     saveQuotes(quotes.filter(q => {
-      const isInWs = q.workspaceId === currentWorkspace.id || (!q.workspaceId && currentWorkspace.id === 'ws_abdoulaye');
+      const isInWs = q.workspaceId === currentWorkspace.id || (!q.workspaceId && currentWorkspace.id === 'ws_default');
       if (isInWs) {
         return !q.isDemo && !q.quoteNumber?.includes('DEV-2026-001') && !q.quoteNumber?.includes('DEV-2026-002');
       }
       return true;
     }));
     saveInvoices(invoices.filter(i => {
-      const isInWs = i.workspaceId === currentWorkspace.id || (!i.workspaceId && currentWorkspace.id === 'ws_abdoulaye');
+      const isInWs = i.workspaceId === currentWorkspace.id || (!i.workspaceId && currentWorkspace.id === 'ws_default');
       if (isInWs) {
         return !i.isDemo && !i.invoiceNumber?.includes('FAC-2026-001') && !i.invoiceNumber?.includes('FAC-2026-002');
       }
       return true;
     }));
     saveAppointments(appointments.filter(a => {
-      const isInWs = a.workspaceId === currentWorkspace.id || (!a.workspaceId && currentWorkspace.id === 'ws_abdoulaye');
+      const isInWs = a.workspaceId === currentWorkspace.id || (!a.workspaceId && currentWorkspace.id === 'ws_default');
       if (isInWs) {
         return !a.isDemo;
       }
       return true;
     }));
     saveNotifications(notifications.filter(n => {
-      const isInWs = n.workspaceId === currentWorkspace.id || (!n.workspaceId && currentWorkspace.id === 'ws_abdoulaye');
+      const isInWs = n.workspaceId === currentWorkspace.id || (!n.workspaceId && currentWorkspace.id === 'ws_default');
       if (isInWs) {
         return !n.isDemo;
       }
@@ -3603,16 +3753,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return false;
     }
     const currentWsId = currentWorkspace.id;
-    saveClients(clients.filter(c => c.workspaceId ? c.workspaceId !== currentWsId : currentWsId !== 'ws_abdoulaye'));
-    saveProjects(projects.filter(p => p.workspaceId ? p.workspaceId !== currentWsId : currentWsId !== 'ws_abdoulaye'));
-    saveQuotes(quotes.filter(q => q.workspaceId ? q.workspaceId !== currentWsId : currentWsId !== 'ws_abdoulaye'));
-    saveInvoices(invoices.filter(i => i.workspaceId ? i.workspaceId !== currentWsId : currentWsId !== 'ws_abdoulaye'));
-    saveAppointments(appointments.filter(a => a.workspaceId ? a.workspaceId !== currentWsId : currentWsId !== 'ws_abdoulaye'));
-    saveTimeEntries(timeEntries.filter(t => t.workspaceId ? t.workspaceId !== currentWsId : currentWsId !== 'ws_abdoulaye'));
-    saveExpenses(expenses.filter(e => e.workspaceId ? e.workspaceId !== currentWsId : currentWsId !== 'ws_abdoulaye'));
-    saveReminderQueue(reminderQueue.filter(r => r.workspaceId ? r.workspaceId !== currentWsId : currentWsId !== 'ws_abdoulaye'));
-    saveLeads(leads.filter(l => l.workspaceId ? l.workspaceId !== currentWsId : currentWsId !== 'ws_abdoulaye'));
-    saveNotifications(notifications.filter(n => n.workspaceId ? n.workspaceId !== currentWsId : currentWsId !== 'ws_abdoulaye'));
+    saveClients(clients.filter(c => c.workspaceId ? c.workspaceId !== currentWsId : currentWsId !== 'ws_default'));
+    saveProjects(projects.filter(p => p.workspaceId ? p.workspaceId !== currentWsId : currentWsId !== 'ws_default'));
+    saveQuotes(quotes.filter(q => q.workspaceId ? q.workspaceId !== currentWsId : currentWsId !== 'ws_default'));
+    saveInvoices(invoices.filter(i => i.workspaceId ? i.workspaceId !== currentWsId : currentWsId !== 'ws_default'));
+    saveAppointments(appointments.filter(a => a.workspaceId ? a.workspaceId !== currentWsId : currentWsId !== 'ws_default'));
+    saveTimeEntries(timeEntries.filter(t => t.workspaceId ? t.workspaceId !== currentWsId : currentWsId !== 'ws_default'));
+    saveExpenses(expenses.filter(e => e.workspaceId ? e.workspaceId !== currentWsId : currentWsId !== 'ws_default'));
+    saveReminderQueue(reminderQueue.filter(r => r.workspaceId ? r.workspaceId !== currentWsId : currentWsId !== 'ws_default'));
+    saveLeads(leads.filter(l => l.workspaceId ? l.workspaceId !== currentWsId : currentWsId !== 'ws_default'));
+    saveNotifications(notifications.filter(n => n.workspaceId ? n.workspaceId !== currentWsId : currentWsId !== 'ws_default'));
     return true;
   };
 

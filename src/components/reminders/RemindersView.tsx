@@ -220,7 +220,7 @@ export const RemindersView: React.FC = () => {
             <span className="p-2 rounded-xl bg-[#f7c548]/20 text-[#f7c548]">
               <Bell className="w-5 h-5" />
             </span>
-            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-white font-display">
+            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-[var(--text-primary)] font-display">
               Centre de Relances
             </h1>
           </div>
@@ -230,7 +230,7 @@ export const RemindersView: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-2">
-          <span className="text-xs px-3 py-1.5 rounded-xl bg-white/[0.04] border border-white/10 text-white font-semibold">
+          <span className="text-xs px-3 py-1.5 rounded-xl bg-[var(--card-surface-elevated)] border border-[var(--border-subtle)] text-[var(--text-primary)] font-semibold">
             {activeReminders.length} action{activeReminders.length > 1 ? 's' : ''} en attente
           </span>
         </div>
@@ -250,7 +250,7 @@ export const RemindersView: React.FC = () => {
             className={`px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer whitespace-nowrap ${
               activeFilter === tab.id
                 ? 'bg-[#f7c548] text-[#0B0F1A]'
-                : 'bg-white/[0.04] text-[#8E97AB] hover:text-white border border-white/10'
+                : 'bg-[var(--card-surface-elevated)] text-[#8E97AB] hover:text-[var(--text-primary)] border border-[var(--border-subtle)]'
             }`}
           >
             {tab.label}
@@ -271,10 +271,10 @@ export const RemindersView: React.FC = () => {
               className="glass-panel p-5 sm:p-6 space-y-4 border-l-4 border-l-[#f7c548] transition-all"
             >
               {/* Card Header */}
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-white/10">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[var(--border-subtle)]">
                 <div className="space-y-1">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <span className="text-xs font-bold text-white font-display">
+                    <span className="text-xs font-bold text-[var(--text-primary)] font-display">
                       {rem.title}
                     </span>
                     <span className="text-[10px] px-2 py-0.5 rounded-full bg-[#D9695F]/15 text-[#D9695F] font-semibold border border-[#D9695F]/30">
@@ -287,7 +287,7 @@ export const RemindersView: React.FC = () => {
                     )}
                   </div>
                   <p className="text-xs text-[#8E97AB]">
-                    Destinataire : <strong className="text-white">{rem.clientName}</strong> ({rem.company}) · {rem.email}
+                    Destinataire : <strong className="text-[var(--text-primary)]">{rem.clientName}</strong> ({rem.company}) · {rem.email}
                   </p>
                 </div>
 
