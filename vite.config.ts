@@ -11,3 +11,12 @@ export default defineConfig({
     ws: false
   }
 });
+
+export default defineConfig({
+  plugins: [react()],
+  // Ajoutez cette section "server" :
+  server: {
+  allowedHosts: ['eyes-onwork.onrender.com']
+  }
+  });
+})
