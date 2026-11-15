@@ -177,23 +177,15 @@ export const RemindersView: React.FC = () => {
   const handleSendEmail = async (rem: ReminderItem) => {
     const messageToSend = editedMessages[rem.id] || rem.defaultMessage;
     try {
-      await fetch('/api/email/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          to: rem.email,
-          recipientName: rem.clientName,
-          subject: `Relance : ${rem.title}`,
-          text: messageToSend,
-          templateKey: 'invoiceReminder'
-        })
-      });
+      await copyMessageToClipboard(messageToSend);
+      const mailtoUrl = `mailto:${encodeURIComponent(rem.email)}?subject=${encodeURIComponent(`Relance : ${rem.title}`)}&body=${encodeURIComponent(messageToSend)}`;
+      window.location.href = mailtoUrl;
 
-      setSentToast(`Relance par email envoyée à ${rem.clientName} (${rem.email})`);
+      setSentToast(`Relance prête pour ${rem.clientName} et copiée dans le presse-papier.`);
       setTimeout(() => setSentToast(null), 4000);
       setDismissedIds(prev => [...prev, rem.id]);
     } catch {
-      setSentToast(`Relance envoyée avec succès à ${rem.clientName}`);
+      setSentToast(`Message de relance copié pour ${rem.clientName}`);
       setTimeout(() => setSentToast(null), 4000);
       setDismissedIds(prev => [...prev, rem.id]);
     }

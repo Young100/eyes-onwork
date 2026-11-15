@@ -19,7 +19,7 @@ import { CustomSelect } from '../common/CustomSelect';
 import { COUNTRY_PRESETS } from '../../data/countryPresets';
 
 export const OnboardingWizardGate: React.FC = () => {
-  const { auth, profile, updateProfile, completeOnboarding } = useApp();
+  const { auth, profile, updateProfile, completeOnboarding, logout } = useApp();
 
   // Step state: resume from profile.onboardingStep or 1
   const [step, setStep] = useState<number>(() => {
@@ -49,6 +49,7 @@ export const OnboardingWizardGate: React.FC = () => {
 
   const [uploadError, setUploadError] = useState('');
   const [stepError, setStepError] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   // Persist current step progress
   useEffect(() => {
@@ -117,30 +118,39 @@ export const OnboardingWizardGate: React.FC = () => {
   };
 
   const handleFinish = async () => {
-    updateProfile({
-      name: formData.name.trim() || 'Freelance',
-      studioName: formData.studioName.trim() || formData.name.trim() || 'Mon Studio',
-      specialty: formData.specialty,
-      logoUrl: formData.logoUrl,
-      avatarUrl: formData.logoUrl,
-      accentColor: formData.accentColor,
-      countryCode: formData.countryCode,
-      currency: formData.currency,
-      timezone: formData.timezone,
-      vatRate: Number(formData.vatRate),
-      siret: formData.siret.trim(),
-      address: formData.address.trim(),
-      phone: formData.phone.trim(),
-      website: formData.website.trim(),
-      legalNotice: formData.legalNotice.trim(),
-      iban: formData.iban.trim(),
-      bic: formData.bic.trim(),
-      onboardingCompleted: true,
-      onboardingStep: 5
-    });
+    if (isSubmitting) return;
+    setStepError('');
+    setIsSubmitting(true);
+    try {
+      updateProfile({
+        name: formData.name.trim() || 'Freelance',
+        studioName: formData.studioName.trim() || formData.name.trim() || 'Mon Studio',
+        specialty: formData.specialty,
+        logoUrl: formData.logoUrl,
+        avatarUrl: formData.logoUrl,
+        accentColor: formData.accentColor,
+        countryCode: formData.countryCode,
+        currency: formData.currency,
+        timezone: formData.timezone,
+        vatRate: Number(formData.vatRate),
+        siret: formData.siret.trim(),
+        address: formData.address.trim(),
+        phone: formData.phone.trim(),
+        website: formData.website.trim(),
+        legalNotice: formData.legalNotice.trim(),
+        iban: formData.iban.trim(),
+        bic: formData.bic.trim(),
+        onboardingStep: 5
+      });
 
-    if (completeOnboarding) {
-      await completeOnboarding(5);
+      if (completeOnboarding) {
+        const res = await completeOnboarding(5);
+        if (res && !res.success) {
+          setStepError(res.error || 'Impossible de finaliser la configuration sur le serveur. Veuillez réessayer.');
+        }
+      }
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -620,19 +630,27 @@ export const OnboardingWizardGate: React.FC = () => {
         )}
 
         {/* Navigation Buttons Footer */}
-        <div className="pt-4 border-t border-white/10 flex items-center justify-between gap-3">
-          {step > 1 ? (
+        <div className="pt-4 border-t border-white/10 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-2">
+            {step > 1 && (
+              <button
+                type="button"
+                onClick={handleBack}
+                className="px-4 py-2.5 rounded-xl text-xs font-semibold text-white bg-white/5 hover:bg-white/10 border border-white/10 transition-colors flex items-center gap-1.5 cursor-pointer"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" />
+                <span>Précédent</span>
+              </button>
+            )}
             <button
               type="button"
-              onClick={handleBack}
-              className="px-4 py-2.5 rounded-xl text-xs font-semibold text-white bg-white/5 hover:bg-white/10 border border-white/10 transition-colors flex items-center gap-1.5 cursor-pointer"
+              onClick={() => logout()}
+              className="px-4 py-2.5 rounded-xl text-xs font-medium text-[#8E97AB] hover:text-white bg-white/5 hover:bg-white/10 border border-white/10 transition-colors flex items-center gap-1.5 cursor-pointer"
             >
               <ArrowLeft className="w-3.5 h-3.5" />
-              <span>Précédent</span>
+              <span>Retour à la connexion</span>
             </button>
-          ) : (
-            <div />
-          )}
+          </div>
 
           {step < 5 ? (
             <button
@@ -647,10 +665,11 @@ export const OnboardingWizardGate: React.FC = () => {
             <button
               type="button"
               onClick={handleFinish}
-              className="px-6 py-3 rounded-xl text-xs font-semibold text-[#0B0F1A] bg-[#f7c548] hover:bg-[#e5b336] active:scale-[0.98] transition-all flex items-center gap-2 cursor-pointer shadow-lg shadow-[#f7c548]/30"
+              disabled={isSubmitting}
+              className="px-6 py-3 rounded-xl text-xs font-semibold text-[#0B0F1A] bg-[#f7c548] hover:bg-[#e5b336] disabled:opacity-60 active:scale-[0.98] transition-all flex items-center gap-2 cursor-pointer shadow-lg shadow-[#f7c548]/30"
             >
               <Sparkles className="w-4 h-4" />
-              <span>Entrer dans mon espace</span>
+              <span>{isSubmitting ? 'Enregistrement...' : 'Entrer dans mon espace'}</span>
             </button>
           )}
         </div>

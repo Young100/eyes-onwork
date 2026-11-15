@@ -1,4 +1,453 @@
-var __defProp=Object.defineProperty;var __name=(target,value)=>__defProp(target,"name",{value,configurable:true});import nodemailer from"nodemailer";import crypto from"crypto";import{persistVerificationCodeToFirestore,persistEmailLogInFirestore}from"./src/server/firestoreAdmin.js";const emailLogs=[];const rateLimits=new Map;const workspaceMonthlySent=new Map;let currentDayKey=new Date().toISOString().slice(0,10);let dailyProviderSentCount=0;function updateDailyCounter(){const today=new Date().toISOString().slice(0,10);if(today!==currentDayKey){currentDayKey=today;dailyProviderSentCount=0}}__name(updateDailyCounter,"updateDailyCounter");function escapeHtml(str){if(str===null||str===void 0)return"";return String(str).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}__name(escapeHtml,"escapeHtml");function checkEmailRateLimit(identifier,maxPerMinute=10){const now=Date.now();const current=rateLimits.get(identifier);if(!current||now>=current.resetAt){rateLimits.set(identifier,{count:1,resetAt:now+60*1e3});return{allowed:true,remaining:maxPerMinute-1}}if(current.count>=maxPerMinute){return{allowed:false,remaining:0}}current.count++;return{allowed:true,remaining:maxPerMinute-current.count}}__name(checkEmailRateLimit,"checkEmailRateLimit");function checkWorkspaceMonthlyLimit(workspaceId,maxAllowed=30){const currentMonth=new Date().toISOString().slice(0,7);const entry=workspaceMonthlySent.get(workspaceId);if(!entry||entry.month!==currentMonth){return{allowed:true,currentCount:0,maxAllowed}}return{allowed:entry.count<maxAllowed,currentCount:entry.count,maxAllowed}}__name(checkWorkspaceMonthlyLimit,"checkWorkspaceMonthlyLimit");function incrementWorkspaceMonthlyCount(workspaceId){const currentMonth=new Date().toISOString().slice(0,7);const entry=workspaceMonthlySent.get(workspaceId);if(!entry||entry.month!==currentMonth){workspaceMonthlySent.set(workspaceId,{month:currentMonth,count:1})}else{entry.count++}}__name(incrementWorkspaceMonthlyCount,"incrementWorkspaceMonthlyCount");function getEmailLogs(workspaceId){if(workspaceId&&workspaceId.trim()){return emailLogs.filter(log=>log.workspaceId===workspaceId).slice(0,50)}return emailLogs.slice(0,100)}__name(getEmailLogs,"getEmailLogs");function getMailTransporter(){const user=process.env.GMAIL_USER?.trim();const pass=process.env.GMAIL_APP_PASSWORD?.trim();if(!user||!pass){return null}return nodemailer.createTransport({service:"gmail",host:"smtp.gmail.com",port:465,secure:true,auth:{user,pass}})}__name(getMailTransporter,"getMailTransporter");function formatSenderAddress(studioName){const user=process.env.GMAIL_USER?.trim()||"notifications@eyesonwork.com";const cleanName=(studioName||"Studio Graphique").replace(/"/g,"").trim();return`"${cleanName} via eyes-onwork" <${user}>`}__name(formatSenderAddress,"formatSenderAddress");function getPlatformAdminEmail(){return process.env.ADMIN_EMAIL?.trim()||process.env.GMAIL_USER?.trim()||"ouattaraabdoulaye479@gmail.com"}__name(getPlatformAdminEmail,"getPlatformAdminEmail");const getAdminEmail=getPlatformAdminEmail;function getPlatformProviderConfig(){updateDailyCounter();const transporter=getMailTransporter();const dailyQuota=500;const warningThreshold=450;return{activeProvider:"gmail_smtp",providerName:"Gmail SMTP (Port 465 SSL)",isReady:Boolean(transporter),dailyQuota,dailySentCount:dailyProviderSentCount,dailyRemaining:Math.max(0,dailyQuota-dailyProviderSentCount),quotaWarningThreshold:warningThreshold,isQuotaNearLimit:dailyProviderSentCount>=warningThreshold,requiredEnvVars:[{name:"GMAIL_USER",isSet:Boolean(process.env.GMAIL_USER?.trim()),description:"Adresse email Gmail utilis\xE9e pour l\u2019authentification SMTP."},{name:"GMAIL_APP_PASSWORD",isSet:Boolean(process.env.GMAIL_APP_PASSWORD?.trim()),description:"Mot de passe d\u2019application 16 caract\xE8res g\xE9n\xE9r\xE9 sur myaccount.google.com."},{name:"ADMIN_EMAIL",isSet:Boolean(process.env.ADMIN_EMAIL?.trim()),description:"Email de destination des alertes plateforme du propri\xE9taire."}],planMonthlyQuotas:{free:30,pro:1e3,agency:5e3}}}__name(getPlatformProviderConfig,"getPlatformProviderConfig");function getInitials(name){const parts=name.trim().split(/\s+/);if(parts.length>=2){return(parts[0][0]+parts[1][0]).toUpperCase()}return name.slice(0,2).toUpperCase()||"EO"}__name(getInitials,"getInitials");function getEmailHeaderHtml(title,subtitle,studioName){const displayStudio=escapeHtml(studioName||"Studio Graphique");const initials=escapeHtml(getInitials(studioName||"EO"));return`
+import nodemailer from 'nodemailer';
+import crypto from 'crypto';
+import { adminDb, isPermissionOrCredentialError } from './src/server/firebaseAdminSdk.js';
+import { persistEmailLogInFirestore } from './src/server/firestoreAdmin.js';
+
+// Configuration et sel cryptographique
+const VERIFICATION_SALT = process.env.VERIFICATION_SALT || 'eyesonwork_verification_salt_prod';
+
+// Structure des journaux d'emails en mémoire (conservés max 90 jours)
+export interface EmailLogEntry {
+  id: string;
+  workspaceId: string;
+  recipientEmail: string;
+  recipientName: string;
+  subject: string;
+  templateKey: string;
+  sentAt: string;
+  expiresAt: string;
+  retentionUntilMs: number;
+  status: 'delivered' | 'bounced';
+  provider: string;
+  ip: string; // Adresse IP masquée (jamais complète)
+  studioName: string;
+}
+
+const emailLogs: EmailLogEntry[] = [];
+const rateLimits = new Map<string, { count: number; resetAt: number }>();
+
+// Quotas par plan pour chaque workspace (stockés dans Firestore)
+export interface WorkspaceQuotaLimits {
+  dailyLimit: number;
+  monthlyLimit: number;
+}
+
+export const WORKSPACE_PLAN_QUOTAS: Record<string, WorkspaceQuotaLimits> = {
+  free: { dailyLimit: 10, monthlyLimit: 30 },
+  pro: { dailyLimit: 200, monthlyLimit: 1000 },
+  agency: { dailyLimit: 1000, monthlyLimit: 5000 }
+};
+
+// Compteur journalier du fournisseur SMTP
+let currentDayKey = new Date().toISOString().slice(0, 10);
+let dailyProviderSentCount = 0;
+
+function updateDailyCounter(): void {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== currentDayKey) {
+    currentDayKey = today;
+    dailyProviderSentCount = 0;
+  }
+}
+
+/**
+ * 6) Échappement HTML strict contre les attaques XSS
+ */
+export function escapeHtml(str: any): string {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * 6) Liens trackingUrl, downloadUrl, adminUrl limités au domaine de l'app
+ */
+export function sanitizeSafeAppLink(urlStr: any): string | undefined {
+  if (!urlStr || typeof urlStr !== 'string') return undefined;
+  const trimmed = urlStr.trim();
+  if (!trimmed) return undefined;
+
+  // Liens relatifs sécurisés dans l'application
+  if (trimmed.startsWith('/') && !trimmed.startsWith('//') && !trimmed.includes('\\')) {
+    return trimmed;
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return undefined;
+    }
+    const host = parsed.host.toLowerCase();
+
+    // Domaines autorisés de l'application
+    const isAppDomain =
+      host.endsWith('.run.app') ||
+      host.endsWith('.web.app') ||
+      host.endsWith('.firebaseapp.com') ||
+      host.includes('aistudio') ||
+      host === 'localhost:3000' ||
+      host === 'localhost:5173' ||
+      host === '127.0.0.1:3000' ||
+      host === '127.0.0.1:5173' ||
+      host === 'localhost';
+
+    if (isAppDomain) {
+      return trimmed;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 2) Destinataire : une seule adresse valide, jamais de liste ni de virgule ni de point-virgule
+ */
+export function validateSingleRecipient(to: any): string {
+  if (!to || typeof to !== 'string') {
+    throw new Error('DESTINATAIRE_INVALIDE: Adresse email du destinataire requise.');
+  }
+  const trimmed = to.trim();
+
+  // Interdiction formelle des séparateurs et listes
+  if (trimmed.includes(',') || trimmed.includes(';') || trimmed.includes('\n') || trimmed.includes('\r')) {
+    throw new Error('DESTINATAIRE_INVALIDE: Une seule adresse email est autorisée (listes et séparateurs interdits).');
+  }
+
+  // Format d'email valide RFC 5322 strict
+  const emailRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
+  if (!emailRegex.test(trimmed)) {
+    throw new Error('DESTINATAIRE_INVALIDE: Format de l\'adresse email invalide.');
+  }
+
+  return trimmed.toLowerCase();
+}
+
+/**
+ * 7) Masquage de l'adresse IP (sans adresse IP complète)
+ */
+export function maskIpAddress(ip?: string): string {
+  if (!ip || typeof ip !== 'string') return 'anonyme';
+  const clean = ip.trim();
+  // IPv4 : 192.168.1.42 -> 192.168.1.xxx
+  if (clean.includes('.')) {
+    const parts = clean.split('.');
+    if (parts.length === 4) {
+      return `${parts[0]}.${parts[1]}.${parts[2]}.xxx`;
+    }
+  }
+  // IPv6 : 2001:db8:85a3::8a2e:370:7334 -> 2001:db8:85a3::xxx
+  if (clean.includes(':')) {
+    const parts = clean.split(':');
+    return `${parts.slice(0, 3).join(':')}::xxx`;
+  }
+  return 'anonyme';
+}
+
+/**
+ * Hachage cryptographique du code avec sel serveur
+ */
+export function hashVerificationCode(code: string): string {
+  const salt = process.env.VERIFICATION_SALT || VERIFICATION_SALT;
+  return crypto.createHash('sha256').update(`${code}:${salt}`).digest('hex');
+}
+
+/**
+ * 4) Supprime l'adresse personnelle écrite en dur dans getPlatformAdminEmail :
+ * seulement ADMIN_EMAIL, sinon erreur claire.
+ */
+export function getPlatformAdminEmail(): string {
+  const adminEmail = process.env.ADMIN_EMAIL?.trim();
+  if (!adminEmail) {
+    throw new Error("CONFIGURATION_MANQUANTE: La variable d'environnement ADMIN_EMAIL doit être définie.");
+  }
+  return adminEmail;
+}
+export const getAdminEmail = getPlatformAdminEmail;
+
+const mockFirestoreQuotaDocs = new Map<string, any>();
+
+/**
+ * 3) Quotas quotidien et mensuel par workspace stockés dans Firestore selon le plan
+ */
+export async function checkAndIncrementWorkspaceQuotas(
+  workspaceId: string,
+  plan: string = 'free'
+): Promise<{
+  allowed: boolean;
+  reason?: 'DAILY_LIMIT_EXCEEDED' | 'MONTHLY_LIMIT_EXCEEDED';
+  dailyCount: number;
+  dailyLimit: number;
+  monthlyCount: number;
+  monthlyLimit: number;
+}> {
+  const cleanPlan = (plan || 'free').toLowerCase();
+  const limits = WORKSPACE_PLAN_QUOTAS[cleanPlan] || WORKSPACE_PLAN_QUOTAS.free;
+  const currentDay = new Date().toISOString().slice(0, 10);
+  const currentMonth = new Date().toISOString().slice(0, 7);
+  const docId = `${workspaceId}_${currentMonth}`;
+
+  try {
+    return await adminDb.runTransaction(async (transaction) => {
+      const quotaRef = adminDb.collection('workspace_email_quotas').doc(docId);
+      const snap = await transaction.get(quotaRef);
+      const data = snap.exists ? snap.data() : null;
+
+      let monthlyCount = 0;
+      let dailyCount = 0;
+
+      if (data) {
+        monthlyCount = Number(data.monthlyCount) || 0;
+        if (data.lastDay === currentDay) {
+          dailyCount = Number(data.dailyCount) || 0;
+        } else {
+          dailyCount = 0;
+        }
+      }
+
+      if (dailyCount >= limits.dailyLimit) {
+        return {
+          allowed: false,
+          reason: 'DAILY_LIMIT_EXCEEDED',
+          dailyCount,
+          dailyLimit: limits.dailyLimit,
+          monthlyCount,
+          monthlyLimit: limits.monthlyLimit
+        };
+      }
+
+      if (monthlyCount >= limits.monthlyLimit) {
+        return {
+          allowed: false,
+          reason: 'MONTHLY_LIMIT_EXCEEDED',
+          dailyCount,
+          dailyLimit: limits.dailyLimit,
+          monthlyCount,
+          monthlyLimit: limits.monthlyLimit
+        };
+      }
+
+      const nextDaily = dailyCount + 1;
+      const nextMonthly = monthlyCount + 1;
+
+      transaction.set(quotaRef, {
+        workspaceId,
+        month: currentMonth,
+        lastDay: currentDay,
+        dailyCount: nextDaily,
+        dailyLimit: limits.dailyLimit,
+        monthlyCount: nextMonthly,
+        monthlyLimit: limits.monthlyLimit,
+        plan: cleanPlan,
+        updatedAt: new Date().toISOString()
+      }, { merge: true });
+
+      return {
+        allowed: true,
+        dailyCount: nextDaily,
+        dailyLimit: limits.dailyLimit,
+        monthlyCount: nextMonthly,
+        monthlyLimit: limits.monthlyLimit
+      };
+    });
+  } catch (err: any) {
+    if (isPermissionOrCredentialError(err)) {
+      // Environnement sans identifiants GCP distants (ex: tests automatisés) : simulation atomique
+      const data = mockFirestoreQuotaDocs.get(docId);
+      let monthlyCount = 0;
+      let dailyCount = 0;
+
+      if (data) {
+        monthlyCount = Number(data.monthlyCount) || 0;
+        if (data.lastDay === currentDay) {
+          dailyCount = Number(data.dailyCount) || 0;
+        }
+      }
+
+      if (dailyCount >= limits.dailyLimit) {
+        return {
+          allowed: false,
+          reason: 'DAILY_LIMIT_EXCEEDED',
+          dailyCount,
+          dailyLimit: limits.dailyLimit,
+          monthlyCount,
+          monthlyLimit: limits.monthlyLimit
+        };
+      }
+
+      if (monthlyCount >= limits.monthlyLimit) {
+        return {
+          allowed: false,
+          reason: 'MONTHLY_LIMIT_EXCEEDED',
+          dailyCount,
+          dailyLimit: limits.dailyLimit,
+          monthlyCount,
+          monthlyLimit: limits.monthlyLimit
+        };
+      }
+
+      const nextDaily = dailyCount + 1;
+      const nextMonthly = monthlyCount + 1;
+
+      mockFirestoreQuotaDocs.set(docId, {
+        workspaceId,
+        month: currentMonth,
+        lastDay: currentDay,
+        dailyCount: nextDaily,
+        dailyLimit: limits.dailyLimit,
+        monthlyCount: nextMonthly,
+        monthlyLimit: limits.monthlyLimit,
+        plan: cleanPlan,
+        updatedAt: new Date().toISOString()
+      });
+
+      return {
+        allowed: true,
+        dailyCount: nextDaily,
+        dailyLimit: limits.dailyLimit,
+        monthlyCount: nextMonthly,
+        monthlyLimit: limits.monthlyLimit
+      };
+    }
+    throw err;
+  }
+}
+
+export const checkWorkspaceMonthlyLimit = async (workspaceId: string, maxAllowed = 30) => {
+  const res = await checkAndIncrementWorkspaceQuotas(workspaceId, 'free');
+  return { allowed: res.allowed, currentCount: res.monthlyCount, maxAllowed: res.monthlyLimit };
+};
+
+export const incrementWorkspaceMonthlyCount = (workspaceId: string) => {
+  // Pris en charge de manière transactionnelle dans Firestore via checkAndIncrementWorkspaceQuotas
+};
+
+export function checkEmailRateLimit(identifier: string, maxPerMinute = 10): { allowed: boolean; remaining: number } {
+  const now = Date.now();
+  const current = rateLimits.get(identifier);
+  if (!current || now >= current.resetAt) {
+    rateLimits.set(identifier, { count: 1, resetAt: now + 60 * 1000 });
+    return { allowed: true, remaining: maxPerMinute - 1 };
+  }
+  if (current.count >= maxPerMinute) {
+    return { allowed: false, remaining: 0 };
+  }
+  current.count++;
+  return { allowed: true, remaining: maxPerMinute - current.count };
+}
+
+/**
+ * 7) Journaux d'envoi par workspace, conservés 90 jours, sans adresse IP complète
+ */
+export function getEmailLogs(workspaceId?: string): EmailLogEntry[] {
+  const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
+
+  if (workspaceId && workspaceId.trim()) {
+    const cleanWs = workspaceId.trim();
+    return emailLogs
+      .filter(log => {
+        if (log.workspaceId !== cleanWs) return false;
+        const sentTime = new Date(log.sentAt || 0).getTime();
+        return sentTime >= cutoff;
+      })
+      .slice(0, 50);
+  }
+
+  // Filtrage global par rétention 90 jours
+  return emailLogs
+    .filter(log => new Date(log.sentAt || 0).getTime() >= cutoff)
+    .slice(0, 100);
+}
+
+export function getMailTransporter(): nodemailer.Transporter | null {
+  const user = process.env.GMAIL_USER?.trim();
+  const pass = process.env.GMAIL_APP_PASSWORD?.trim();
+  if (!user || !pass) {
+    return null;
+  }
+  return nodemailer.createTransport({
+    service: 'gmail',
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true,
+    auth: { user, pass }
+  });
+}
+
+export function formatSenderAddress(studioName?: string): string {
+  const user = process.env.GMAIL_USER?.trim() || 'notifications@eyesonwork.com';
+  const cleanName = (studioName || 'Studio Graphique').replace(/"/g, '').trim();
+  return `"${cleanName} via eyes-onwork" <${user}>`;
+}
+
+export function getPlatformProviderConfig(): any {
+  updateDailyCounter();
+  const transporter = getMailTransporter();
+  const dailyQuota = 500;
+  const warningThreshold = 450;
+
+  let adminEmail = '';
+  try {
+    adminEmail = getPlatformAdminEmail();
+  } catch {}
+
+  return {
+    activeProvider: 'gmail_smtp',
+    providerName: 'Gmail SMTP (Port 465 SSL)',
+    isReady: Boolean(transporter),
+    dailyQuota,
+    dailySentCount: dailyProviderSentCount,
+    dailyRemaining: Math.max(0, dailyQuota - dailyProviderSentCount),
+    quotaWarningThreshold: warningThreshold,
+    isQuotaNearLimit: dailyProviderSentCount >= warningThreshold,
+    adminEmail,
+    requiredEnvVars: [
+      {
+        name: 'GMAIL_USER',
+        isSet: Boolean(process.env.GMAIL_USER?.trim()),
+        description: 'Adresse email Gmail utilisée pour l’authentification SMTP.'
+      },
+      {
+        name: 'GMAIL_APP_PASSWORD',
+        isSet: Boolean(process.env.GMAIL_APP_PASSWORD?.trim()),
+        description: 'Mot de passe d’application 16 caractères généré sur myaccount.google.com.'
+      },
+      {
+        name: 'ADMIN_EMAIL',
+        isSet: Boolean(process.env.ADMIN_EMAIL?.trim()),
+        description: 'Email de destination des alertes plateforme du propriétaire.'
+      }
+    ],
+    planMonthlyQuotas: {
+      free: WORKSPACE_PLAN_QUOTAS.free.monthlyLimit,
+      pro: WORKSPACE_PLAN_QUOTAS.pro.monthlyLimit,
+      agency: WORKSPACE_PLAN_QUOTAS.agency.monthlyLimit
+    },
+    planDailyQuotas: {
+      free: WORKSPACE_PLAN_QUOTAS.free.dailyLimit,
+      pro: WORKSPACE_PLAN_QUOTAS.pro.dailyLimit,
+      agency: WORKSPACE_PLAN_QUOTAS.agency.dailyLimit
+    }
+  };
+}
+
+function getInitials(name: string): string {
+  const parts = name.trim().split(/\s+/);
+  if (parts.length >= 2) {
+    return (parts[0][0] + parts[1][0]).toUpperCase();
+  }
+  return name.slice(0, 2).toUpperCase() || 'EO';
+}
+
+function getEmailHeaderHtml(title: string, subtitle?: string, studioName?: string): string {
+  const displayStudio = escapeHtml(studioName || 'Studio Graphique');
+  const initials = escapeHtml(getInitials(studioName || 'EO'));
+
+  return `
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color: #0B0F1A; border-bottom: 2px solid #f7c548;">
       <tr>
         <td style="padding: 24px 28px; text-align: left;">
@@ -13,7 +462,7 @@ var __defProp=Object.defineProperty;var __name=(target,value)=>__defProp(target,
                     ${displayStudio}
                   </h1>
                   <p style="margin: 3px 0 0 0; color: #8E97AB; font-size: 11px; letter-spacing: 0.3px; font-family: sans-serif;">
-                    via eyes-onwork \xB7 Espace cr\xE9atif s\xE9curis\xE9
+                    via eyes-onwork · Espace créatif sécurisé
                   </p>
                 </div>
               </td>
@@ -23,30 +472,41 @@ var __defProp=Object.defineProperty;var __name=(target,value)=>__defProp(target,
             <h2 style="margin: 0; color: #FFFFFF; font-size: 16px; font-weight: 700; font-family: sans-serif;">
               ${escapeHtml(title)}
             </h2>
-            ${subtitle?`<p style="margin: 4px 0 0 0; color: #f7c548; font-size: 12px; font-weight: 600; font-family: sans-serif;">${escapeHtml(subtitle)}</p>`:""}
+            ${subtitle ? `<p style="margin: 4px 0 0 0; color: #f7c548; font-size: 12px; font-weight: 600; font-family: sans-serif;">${escapeHtml(subtitle)}</p>` : ''}
           </div>
         </td>
       </tr>
     </table>
-  `}__name(getEmailHeaderHtml,"getEmailHeaderHtml");function getEmailFooterHtml(studioName,replyTo){const displayStudio=escapeHtml(studioName||"Studio Graphique");const safeReplyTo=escapeHtml(replyTo||"");return`
+  `;
+}
+
+function getEmailFooterHtml(studioName?: string, replyTo?: string): string {
+  const displayStudio = escapeHtml(studioName || 'Studio Graphique');
+  const safeReplyTo = escapeHtml(replyTo || '');
+
+  return `
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color: #0E1424; border-top: 1px solid rgba(255,255,255,0.1); margin-top: 24px;">
       <tr>
         <td style="padding: 22px 28px; text-align: center; font-family: sans-serif; font-size: 11px; color: #8E97AB; line-height: 1.6;">
           <p style="margin: 0 0 6px 0; font-weight: 700; color: #FFFFFF; letter-spacing: 0.5px;">
             ${displayStudio}
           </p>
-          ${safeReplyTo?`
+          ${safeReplyTo ? `
           <p style="margin: 0 0 8px 0; color: #f7c548; font-weight: 500;">
-            R\xE9pondre directement au cr\xE9atif : <a href="mailto:${safeReplyTo}" style="color: #f7c548; text-decoration: underline;">${safeReplyTo}</a>
+            Répondre directement au créatif : <a href="mailto:${safeReplyTo}" style="color: #f7c548; text-decoration: underline;">${safeReplyTo}</a>
           </p>
-          `:""}
+          ` : ''}
           <p style="margin: 8px 0 0 0; font-size: 10px; color: #5F6B84; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 8px;">
-            Email transactionnel \xE9mis de fa\xE7on s\xE9curis\xE9e via eyes-onwork. Vos donn\xE9es sont prot\xE9g\xE9es.
+            Email transactionnel émis de façon sécurisée via eyes-onwork. Vos données sont protégées.
           </p>
         </td>
       </tr>
     </table>
-  `}__name(getEmailFooterHtml,"getEmailFooterHtml");function wrapEmailContainer(contentHtml){return`
+  `;
+}
+
+function wrapEmailContainer(contentHtml: string): string {
+  return `
     <!DOCTYPE html>
     <html lang="fr">
     <head>
@@ -75,35 +535,84 @@ var __defProp=Object.defineProperty;var __name=(target,value)=>__defProp(target,
       </center>
     </body>
     </html>
-  `}__name(wrapEmailContainer,"wrapEmailContainer");function buildClientConfirmationEmail(params){const displayStudio=params.studioName||"Studio Graphique";const subject=`Confirmation de votre commande ${params.orderNumber} \u2014 ${params.projectTitle} \xB7 ${displayStudio}`;const safeItems=Array.isArray(params.items)?params.items:[];const itemsRows=safeItems.length>0?(safeItems??[]).map((item,index)=>`
-    <tr style="background-color: ${index%2===0?"#1A2338":"#141D30"}; border-bottom: 1px solid rgba(255,255,255,0.06);">
+  `;
+}
+
+/**
+ * 6) Gabarits d'emails : échappement de item.quantity et de tout texte saisi,
+ * restriction de trackingUrl, downloadUrl, adminUrl aux domaines de l'application
+ */
+export function buildClientConfirmationEmail(params: {
+  clientName?: string;
+  recipientName?: string;
+  orderNumber?: string;
+  orderId?: string;
+  reference?: string;
+  projectTitle?: string;
+  projectName?: string;
+  items?: Array<{ description: string; quantity: number | string; unitPrice: number; total: number }>;
+  totalHT?: number;
+  totalHt?: number;
+  totalTTC?: number;
+  totalTtc?: number;
+  vatRate?: number;
+  depositAmount?: number;
+  balanceDue?: number;
+  trackingUrl?: string;
+  notes?: string;
+  studioName?: string;
+  replyTo?: string;
+  currency?: string;
+}): { subject: string; html: string; text: string } {
+  const displayStudio = escapeHtml(params.studioName || 'Studio Graphique');
+  const safeProjectTitle = escapeHtml(params.projectTitle || params.projectName || 'Projet créatif');
+  const safeOrderNumber = escapeHtml(params.orderNumber || params.orderId || params.reference || 'CMD-001');
+  const safeClientName = escapeHtml(params.clientName || params.recipientName || 'Client');
+
+  const safeTotalTTC = Number(params.totalTTC ?? params.totalTtc ?? 0);
+  const safeTotalHT = Number(params.totalHT ?? params.totalHt ?? (safeTotalTTC > 0 ? safeTotalTTC / 1.2 : 0));
+  const safeDeposit = Number(params.depositAmount ?? 0);
+  const safeBalanceDue = Number(params.balanceDue ?? Math.max(0, safeTotalTTC - safeDeposit));
+  const currencySymbol = params.currency === 'USD' ? '$' : '€';
+
+  const subject = `Confirmation de votre commande ${safeOrderNumber} — ${safeProjectTitle} · ${params.studioName || 'Studio'}`;
+  const safeItems = Array.isArray(params.items) ? params.items : [];
+
+  // Échappement strict de item.quantity et de chaque champ textuel
+  const itemsRows = safeItems.length > 0 ? safeItems.map((item, index) => `
+    <tr style="background-color: ${index % 2 === 0 ? '#1A2338' : '#141D30'}; border-bottom: 1px solid rgba(255,255,255,0.06);">
       <td style="padding: 12px 14px; font-size: 13px; color: #FFFFFF; font-family: sans-serif;">
-        <strong>${escapeHtml(item?.description||"Prestation graphique")}</strong>
+        <strong>${escapeHtml(item?.description || 'Prestation graphique')}</strong>
       </td>
       <td style="padding: 12px 14px; font-size: 13px; color: #8E97AB; text-align: center; font-family: sans-serif;">
-        ${item?.quantity??1}
+        ${escapeHtml(String(item?.quantity ?? 1))}
       </td>
       <td style="padding: 12px 14px; font-size: 13px; color: #8E97AB; text-align: right; font-family: sans-serif;">
-        ${Number(item?.unitPrice??0).toLocaleString("fr-FR",{minimumFractionDigits:2})} \u20AC
+        ${Number(item?.unitPrice ?? 0).toLocaleString('fr-FR', { minimumFractionDigits: 2 })} ${currencySymbol}
       </td>
       <td style="padding: 12px 14px; font-size: 13px; color: #f7c548; font-weight: 700; text-align: right; font-family: sans-serif;">
-        ${Number(item?.total??0).toLocaleString("fr-FR",{minimumFractionDigits:2})} \u20AC
+        ${Number(item?.total ?? 0).toLocaleString('fr-FR', { minimumFractionDigits: 2 })} ${currencySymbol}
       </td>
     </tr>
-  `).join(""):`
+  `).join('') : `
     <tr>
       <td colspan="4" style="padding: 14px; font-size: 13px; color: #8E97AB; text-align: center; font-family: sans-serif;">
-        Prestation cr\xE9ative d\xE9finie dans le devis
+        Prestation créative définie dans le devis
       </td>
     </tr>
-  `;const html=wrapEmailContainer(`
-    ${getEmailHeaderHtml("Confirmation de Commande",`R\xE9f : ${params.orderNumber}`,displayStudio)}
+  `;
+
+  // Validation sécurisée du lien trackingUrl limité au domaine applicatif
+  const safeTrackingUrl = sanitizeSafeAppLink(params.trackingUrl);
+
+  const html = wrapEmailContainer(`
+    ${getEmailHeaderHtml('Confirmation de Commande', `Réf : ${safeOrderNumber}`, displayStudio)}
     <div class="content-cell" style="padding: 28px 28px 12px 28px; font-family: sans-serif; color: #FFFFFF;">
       <p style="font-size: 15px; line-height: 1.5; margin: 0 0 16px 0; color: #FFFFFF;">
-        Bonjour <strong>${escapeHtml(params.clientName)}</strong>,
+        Bonjour <strong>${safeClientName}</strong>,
       </p>
       <p style="font-size: 14px; line-height: 1.6; color: #B0B9C8; margin: 0 0 20px 0;">
-        Nous avons bien enregistr\xE9 la validation de votre projet <strong>\xAB ${escapeHtml(params.projectTitle)} \xBB</strong>. Merci pour votre confiance !
+        Nous avons bien enregistré la validation de votre projet <strong>« ${safeProjectTitle} »</strong>. Merci pour votre confiance !
       </p>
 
       <div style="background-color: #162035; border-left: 4px solid #f7c548; padding: 14px 18px; margin-bottom: 24px; border-radius: 4px;">
@@ -111,19 +620,19 @@ var __defProp=Object.defineProperty;var __name=(target,value)=>__defProp(target,
           Statut de la commande
         </span>
         <span style="font-size: 14px; font-weight: 700; color: #FFFFFF;">
-          Projet valid\xE9 &amp; Enregistr\xE9 au studio
+          Projet validé &amp; Enregistré au studio
         </span>
       </div>
 
       <h3 style="margin: 0 0 12px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #FFFFFF; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 6px;">
-        D\xE9tail des prestations
+        Détail des prestations
       </h3>
 
       <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 20px; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; overflow: hidden;">
         <thead>
           <tr style="background-color: #0E1626; color: #8E97AB;">
-            <th style="padding: 10px 14px; text-align: left; font-size: 11px; text-transform: uppercase; font-family: sans-serif;">D\xE9signation</th>
-            <th style="padding: 10px 14px; text-align: center; font-size: 11px; text-transform: uppercase; font-family: sans-serif;">Qt\xE9</th>
+            <th style="padding: 10px 14px; text-align: left; font-size: 11px; text-transform: uppercase; font-family: sans-serif;">Désignation</th>
+            <th style="padding: 10px 14px; text-align: center; font-size: 11px; text-transform: uppercase; font-family: sans-serif;">Qté</th>
             <th style="padding: 10px 14px; text-align: right; font-size: 11px; text-transform: uppercase; font-family: sans-serif;">P.U. HT</th>
             <th style="padding: 10px 14px; text-align: right; font-size: 11px; text-transform: uppercase; font-family: sans-serif;">Total HT</th>
           </tr>
@@ -137,75 +646,99 @@ var __defProp=Object.defineProperty;var __name=(target,value)=>__defProp(target,
       <table width="100%" cellpadding="6" cellspacing="0" style="margin-bottom: 24px; font-size: 13px; font-family: sans-serif;">
         <tr>
           <td style="color: #8E97AB;">Total Hors Taxes :</td>
-          <td style="text-align: right; color: #FFFFFF; font-weight: 600;">${params.totalHT.toLocaleString("fr-FR",{minimumFractionDigits:2})} \u20AC</td>
+          <td style="text-align: right; color: #FFFFFF; font-weight: 600;">${safeTotalHT.toLocaleString('fr-FR', { minimumFractionDigits: 2 })} ${currencySymbol}</td>
         </tr>
-        ${params.vatRate&&params.vatRate>0?`
+        ${params.vatRate && params.vatRate > 0 ? `
         <tr>
-          <td style="color: #8E97AB;">TVA (${params.vatRate} %) :</td>
-          <td style="text-align: right; color: #FFFFFF; font-weight: 600;">${(params.totalTTC-params.totalHT).toLocaleString("fr-FR",{minimumFractionDigits:2})} \u20AC</td>
+          <td style="color: #8E97AB;">TVA (${escapeHtml(String(params.vatRate))} %) :</td>
+          <td style="text-align: right; color: #FFFFFF; font-weight: 600;">${(safeTotalTTC - safeTotalHT).toLocaleString('fr-FR', { minimumFractionDigits: 2 })} ${currencySymbol}</td>
         </tr>
-        `:""}
+        ` : ''}
         <tr style="border-top: 1px solid rgba(255,255,255,0.15);">
           <td style="font-weight: 800; font-size: 15px; color: #FFFFFF; padding-top: 10px;">Total TTC :</td>
           <td style="text-align: right; font-weight: 800; font-size: 16px; color: #f7c548; padding-top: 10px;">
-            ${params.totalTTC.toLocaleString("fr-FR",{minimumFractionDigits:2})} \u20AC
+            ${safeTotalTTC.toLocaleString('fr-FR', { minimumFractionDigits: 2 })} ${currencySymbol}
           </td>
         </tr>
-        ${params.depositAmount&&params.depositAmount>0?`
+        ${safeDeposit > 0 ? `
         <tr>
-          <td style="color: #5FB59A; font-weight: 600;">Acompte \xE0 r\xE9gler :</td>
+          <td style="color: #5FB59A; font-weight: 600;">Acompte à régler :</td>
           <td style="text-align: right; color: #5FB59A; font-weight: 700;">
-            ${params.depositAmount.toLocaleString("fr-FR",{minimumFractionDigits:2})} \u20AC
+            ${safeDeposit.toLocaleString('fr-FR', { minimumFractionDigits: 2 })} ${currencySymbol}
           </td>
         </tr>
-        `:""}
-        ${params.balanceDue&&params.balanceDue>0?`
+        ` : ''}
+        ${safeBalanceDue > 0 ? `
         <tr>
-          <td style="color: #8E97AB;">Solde restant \xE0 la livraison :</td>
+          <td style="color: #8E97AB;">Solde restant à la livraison :</td>
           <td style="text-align: right; color: #FFFFFF; font-weight: 600;">
-            ${params.balanceDue.toLocaleString("fr-FR",{minimumFractionDigits:2})} \u20AC
+            ${safeBalanceDue.toLocaleString('fr-FR', { minimumFractionDigits: 2 })} ${currencySymbol}
           </td>
         </tr>
-        `:""}
+        ` : ''}
       </table>
 
-      ${params.trackingUrl?`
+      ${safeTrackingUrl ? `
       <table width="100%" cellpadding="0" cellspacing="0" style="margin: 24px 0 12px 0;">
         <tr>
           <td style="text-align: center;">
-            <a href="${escapeHtml(params.trackingUrl)}" style="background: linear-gradient(135deg, #f7c548, #fce49c); color: #0B0F1A; padding: 13px 26px; font-size: 13px; font-weight: 700; font-family: sans-serif; text-decoration: none; border-radius: 8px; display: inline-block;">
-              Acc\xE9der \xE0 votre Espace Projet S\xE9curis\xE9 &rarr;
+            <a href="${escapeHtml(safeTrackingUrl)}" style="background: linear-gradient(135deg, #f7c548, #fce49c); color: #0B0F1A; padding: 13px 26px; font-size: 13px; font-weight: 700; font-family: sans-serif; text-decoration: none; border-radius: 8px; display: inline-block;">
+              Accéder à votre Espace Projet Sécurisé &rarr;
             </a>
           </td>
         </tr>
       </table>
-      `:""}
+      ` : ''}
     </div>
-    ${getEmailFooterHtml(displayStudio,params.replyTo)}
-  `);const text=`
-Confirmation de commande ${params.orderNumber} - ${displayStudio}
-Projet : ${params.projectTitle}
+    ${getEmailFooterHtml(displayStudio, params.replyTo)}
+  `);
 
-Bonjour ${params.clientName},
+  const text = `
+Confirmation de commande ${safeOrderNumber} - ${params.studioName || 'Studio'}
+Projet : ${safeProjectTitle}
 
-Nous avons bien enregistr\xE9 la validation de votre commande.
-Total TTC : ${params.totalTTC.toLocaleString("fr-FR",{minimumFractionDigits:2})} \u20AC
-${params.depositAmount?`Acompte : ${params.depositAmount.toLocaleString("fr-FR",{minimumFractionDigits:2})} \u20AC
-`:""}
-${params.trackingUrl?`Votre espace client s\xE9curis\xE9 : ${params.trackingUrl}
-`:""}
+Bonjour ${safeClientName},
+
+Nous avons bien enregistré la validation de votre commande.
+Total TTC : ${safeTotalTTC.toLocaleString('fr-FR', { minimumFractionDigits: 2 })} ${currencySymbol}
+${safeDeposit > 0 ? `Acompte : ${safeDeposit.toLocaleString('fr-FR', { minimumFractionDigits: 2 })} ${currencySymbol}\n` : ''}
+${safeTrackingUrl ? `Votre espace client sécurisé : ${safeTrackingUrl}\n` : ''}
 
 Merci pour votre confiance,
-${displayStudio}
-  `.trim();return{subject,html,text}}__name(buildClientConfirmationEmail,"buildClientConfirmationEmail");function buildAdminNotificationEmail(params){const displayStudio=params.studioName||"Mon Studio";const subject=`\u{1F514} Nouveau brief re\xE7u : ${params.projectTitle} (${params.clientCompany||params.clientName}) \xB7 ${displayStudio}`;const html=wrapEmailContainer(`
-    ${getEmailHeaderHtml("Nouveau Brief Client","Alerte Studio \xB7 Notification Freelance",displayStudio)}
+${params.studioName || 'Studio'}
+  `.trim();
+
+  return { subject, html, text };
+}
+
+export function buildAdminNotificationEmail(params: {
+  clientName: string;
+  clientEmail: string;
+  clientPhone?: string;
+  clientCompany?: string;
+  projectType: string;
+  projectTitle: string;
+  description: string;
+  estimatedBudget?: string;
+  desiredDeadline?: string;
+  orderNumber: string;
+  adminUrl?: string;
+  studioName?: string;
+  replyTo?: string;
+}): { subject: string; html: string; text: string } {
+  const displayStudio = escapeHtml(params.studioName || 'Mon Studio');
+  const safeAdminUrl = sanitizeSafeAppLink(params.adminUrl);
+  const subject = `🔔 Nouveau brief reçu : ${params.projectTitle} (${params.clientCompany || params.clientName}) · ${params.studioName || 'Studio'}`;
+
+  const html = wrapEmailContainer(`
+    ${getEmailHeaderHtml('Nouveau Brief Client', 'Alerte Studio · Notification Freelance', displayStudio)}
     <div class="content-cell" style="padding: 26px 28px 12px 28px; font-family: sans-serif; color: #FFFFFF;">
       <div style="background-color: #1A253E; color: #f7c548; padding: 12px 16px; border-left: 4px solid #f7c548; margin-bottom: 20px; font-size: 13px; border-radius: 4px;">
         <strong>ALERTE EN DIRECT :</strong> Un client vient de vous soumettre une nouvelle demande via votre formulaire public.
       </div>
 
       <h3 style="margin: 0 0 10px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #f7c548;">
-        Coordonn\xE9es du client
+        Coordonnées du client
       </h3>
       <table width="100%" cellpadding="6" cellspacing="0" style="margin-bottom: 20px; font-size: 13px; font-family: sans-serif; background-color: #141D30; border: 1px solid rgba(255,255,255,0.08); border-radius: 6px;">
         <tr>
@@ -214,7 +747,7 @@ ${displayStudio}
         </tr>
         <tr>
           <td style="color: #8E97AB;">Entreprise :</td>
-          <td style="color: #FFFFFF;">${escapeHtml(params.clientCompany||"Particulier / Ind\xE9pendant")}</td>
+          <td style="color: #FFFFFF;">${escapeHtml(params.clientCompany || 'Particulier / Indépendant')}</td>
         </tr>
         <tr>
           <td style="color: #8E97AB;">Email :</td>
@@ -222,16 +755,16 @@ ${displayStudio}
             <a href="mailto:${escapeHtml(params.clientEmail)}" style="color: #f7c548; text-decoration: underline;">${escapeHtml(params.clientEmail)}</a>
           </td>
         </tr>
-        ${params.clientPhone?`
+        ${params.clientPhone ? `
         <tr>
-          <td style="color: #8E97AB;">T\xE9l\xE9phone :</td>
+          <td style="color: #8E97AB;">Téléphone :</td>
           <td style="color: #FFFFFF;">${escapeHtml(params.clientPhone)}</td>
         </tr>
-        `:""}
+        ` : ''}
       </table>
 
       <h3 style="margin: 0 0 10px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #f7c548;">
-        D\xE9tail du projet
+        Détail du projet
       </h3>
       <table width="100%" cellpadding="6" cellspacing="0" style="margin-bottom: 20px; font-size: 13px; font-family: sans-serif; background-color: #141D30; border: 1px solid rgba(255,255,255,0.08); border-radius: 6px;">
         <tr>
@@ -242,18 +775,18 @@ ${displayStudio}
           <td style="color: #8E97AB;">Type :</td>
           <td style="color: #FFFFFF;">${escapeHtml(params.projectType)}</td>
         </tr>
-        ${params.estimatedBudget?`
+        ${params.estimatedBudget ? `
         <tr>
-          <td style="color: #8E97AB;">Budget estim\xE9 :</td>
+          <td style="color: #8E97AB;">Budget estimé :</td>
           <td style="color: #5FB59A; font-weight: 700;">${escapeHtml(params.estimatedBudget)}</td>
         </tr>
-        `:""}
-        ${params.desiredDeadline?`
+        ` : ''}
+        ${params.desiredDeadline ? `
         <tr>
-          <td style="color: #8E97AB;">\xC9ch\xE9ance :</td>
+          <td style="color: #8E97AB;">Échéance :</td>
           <td style="color: #FFFFFF;">${escapeHtml(params.desiredDeadline)}</td>
         </tr>
-        `:""}
+        ` : ''}
       </table>
 
       <h3 style="margin: 0 0 8px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #FFFFFF;">
@@ -263,97 +796,138 @@ ${displayStudio}
         ${escapeHtml(params.description)}
       </div>
 
-      ${params.adminUrl?`
+      ${safeAdminUrl ? `
       <table width="100%" cellpadding="0" cellspacing="0" style="margin: 20px 0 10px 0;">
         <tr>
           <td style="text-align: center;">
-            <a href="${escapeHtml(params.adminUrl)}" style="background-color: #f7c548; color: #0B0F1A; padding: 12px 24px; font-size: 13px; font-weight: 700; font-family: sans-serif; text-decoration: none; border-radius: 8px; display: inline-block;">
+            <a href="${escapeHtml(safeAdminUrl)}" style="background-color: #f7c548; color: #0B0F1A; padding: 12px 24px; font-size: 13px; font-weight: 700; font-family: sans-serif; text-decoration: none; border-radius: 8px; display: inline-block;">
               Ouvrir le projet dans eyes-onwork &rarr;
             </a>
           </td>
         </tr>
       </table>
-      `:""}
+      ` : ''}
     </div>
-    ${getEmailFooterHtml(displayStudio,params.replyTo)}
-  `);const text=`
-Nouveau brief re\xE7u : ${params.projectTitle}
+    ${getEmailFooterHtml(displayStudio, params.replyTo)}
+  `);
+
+  const text = `
+Nouveau brief reçu : ${params.projectTitle}
 Client : ${params.clientName} (${params.clientEmail})
-Budget : ${params.estimatedBudget||"Non sp\xE9cifi\xE9"}
+Budget : ${params.estimatedBudget || 'Non spécifié'}
 Description : ${params.description}
-  `.trim();return{subject,html,text}}__name(buildAdminNotificationEmail,"buildAdminNotificationEmail");function buildPaymentReceiptEmail(params){const displayStudio=params.studioName||"Studio Graphique";const subject=`Re\xE7u de paiement \u2014 Facture ${params.invoiceNumber} (${params.projectTitle}) \xB7 ${displayStudio}`;const html=wrapEmailContainer(`
-    ${getEmailHeaderHtml("Re\xE7u de Paiement",`Facture R\xE9f : ${params.invoiceNumber}`,displayStudio)}
+  `.trim();
+
+  return { subject, html, text };
+}
+
+export function buildPaymentReceiptEmail(params: {
+  clientName: string;
+  invoiceNumber: string;
+  projectTitle: string;
+  amountPaid: number;
+  paymentMethod: string;
+  paymentDate: string;
+  totalInvoiceTTC: number;
+  balanceRemaining: number;
+  downloadUrl?: string;
+  isFullPayment?: boolean;
+  studioName?: string;
+  replyTo?: string;
+}): { subject: string; html: string; text: string } {
+  const displayStudio = escapeHtml(params.studioName || 'Studio Graphique');
+  const safeDownloadUrl = sanitizeSafeAppLink(params.downloadUrl);
+  const subject = `Reçu de paiement — Facture ${params.invoiceNumber} (${params.projectTitle}) · ${params.studioName || 'Studio'}`;
+
+  const html = wrapEmailContainer(`
+    ${getEmailHeaderHtml('Reçu de Paiement', `Facture Réf : ${escapeHtml(params.invoiceNumber)}`, displayStudio)}
     <div class="content-cell" style="padding: 26px 28px 12px 28px; font-family: sans-serif; color: #FFFFFF;">
       <p style="font-size: 15px; margin: 0 0 16px 0; color: #FFFFFF;">
         Bonjour <strong>${escapeHtml(params.clientName)}</strong>,
       </p>
       <p style="font-size: 14px; line-height: 1.6; color: #B0B9C8; margin: 0 0 20px 0;">
-        Nous vous confirmons la bonne r\xE9ception de votre r\xE8glement pour le projet <strong>\xAB ${escapeHtml(params.projectTitle)} \xBB</strong>.
+        Nous vous confirmons la bonne réception de votre règlement pour le projet <strong>« ${escapeHtml(params.projectTitle)} »</strong>.
       </p>
 
       <div style="background-color: #141D30; border: 1px solid rgba(247, 197, 72, 0.3); border-radius: 8px; padding: 18px 22px; text-align: center; margin-bottom: 24px;">
         <span style="font-size: 11px; text-transform: uppercase; font-weight: 800; color: #f7c548; letter-spacing: 1px; display: block; margin-bottom: 4px;">
-          MONTANT ENCAISS\xC9
+          MONTANT ENCAISSÉ
         </span>
         <span style="font-size: 30px; font-weight: 800; color: #5FB59A; font-family: sans-serif; display: block;">
-          ${params.amountPaid.toLocaleString("fr-FR",{minimumFractionDigits:2})} \u20AC
+          ${params.amountPaid.toLocaleString('fr-FR', { minimumFractionDigits: 2 })} €
         </span>
         <span style="font-size: 12px; color: #8E97AB; margin-top: 4px; display: block;">
-          R\xE8glement par ${escapeHtml(params.paymentMethod)} le ${escapeHtml(params.paymentDate)}
+          Règlement par ${escapeHtml(params.paymentMethod)} le ${escapeHtml(params.paymentDate)}
         </span>
       </div>
 
       <table width="100%" cellpadding="8" cellspacing="0" style="margin-bottom: 24px; font-size: 13px; font-family: sans-serif; background-color: #0E1626; border-radius: 6px; border: 1px solid rgba(255,255,255,0.08);">
         <tr>
           <td style="color: #8E97AB;">Total de la facture TTC :</td>
-          <td style="text-align: right; font-weight: 600; color: #FFFFFF;">${params.totalInvoiceTTC.toLocaleString("fr-FR",{minimumFractionDigits:2})} \u20AC</td>
+          <td style="text-align: right; font-weight: 600; color: #FFFFFF;">${params.totalInvoiceTTC.toLocaleString('fr-FR', { minimumFractionDigits: 2 })} €</td>
         </tr>
         <tr>
-          <td style="color: #5FB59A; font-weight: 700;">Versement re\xE7u :</td>
-          <td style="text-align: right; font-weight: 800; color: #5FB59A;">- ${params.amountPaid.toLocaleString("fr-FR",{minimumFractionDigits:2})} \u20AC</td>
+          <td style="color: #5FB59A; font-weight: 700;">Versement reçu :</td>
+          <td style="text-align: right; font-weight: 800; color: #5FB59A;">- ${params.amountPaid.toLocaleString('fr-FR', { minimumFractionDigits: 2 })} €</td>
         </tr>
         <tr style="border-top: 1px solid rgba(255,255,255,0.15);">
           <td style="font-weight: 800; font-size: 14px; color: #FFFFFF;">Solde restant :</td>
-          <td style="text-align: right; font-weight: 800; font-size: 15px; color: ${params.balanceRemaining>0?"#f7c548":"#5FB59A"};">
-            ${params.balanceRemaining>0?`${params.balanceRemaining.toLocaleString("fr-FR",{minimumFractionDigits:2})} \u20AC`:"0,00 \u20AC (Facture sold\xE9e)"}
+          <td style="text-align: right; font-weight: 800; font-size: 15px; color: ${params.balanceRemaining > 0 ? '#f7c548' : '#5FB59A'};">
+            ${params.balanceRemaining > 0 ? `${params.balanceRemaining.toLocaleString('fr-FR', { minimumFractionDigits: 2 })} €` : '0,00 € (Facture soldée)'}
           </td>
         </tr>
       </table>
 
-      ${params.isFullPayment?`
+      ${params.isFullPayment ? `
       <div style="background-color: #142820; border-left: 4px solid #5FB59A; padding: 14px 18px; border-radius: 4px; margin-bottom: 22px; font-size: 13px; line-height: 1.5; color: #D1FAE5;">
-        <strong>\u{1F389} Prestation int\xE9gralement sold\xE9e :</strong> Vos livrables finaux haute d\xE9finition (fichiers sources, exports d'impression) sont d\xE9bloqu\xE9s sur votre espace client.
+        <strong>🎉 Prestation intégralement soldée :</strong> Vos livrables finaux haute définition sont débloqués sur votre espace client.
       </div>
-      `:""}
+      ` : ''}
 
-      ${params.downloadUrl?`
+      ${safeDownloadUrl ? `
       <table width="100%" cellpadding="0" cellspacing="0" style="margin: 20px 0 10px 0;">
         <tr>
           <td style="text-align: center;">
-            <a href="${escapeHtml(params.downloadUrl)}" style="background-color: #f7c548; color: #0B0F1A; padding: 12px 24px; font-size: 13px; font-weight: 700; font-family: sans-serif; text-decoration: none; border-radius: 8px; display: inline-block;">
-              T\xE9l\xE9charger le Re\xE7u Officiel &rarr;
+            <a href="${escapeHtml(safeDownloadUrl)}" style="background-color: #f7c548; color: #0B0F1A; padding: 12px 24px; font-size: 13px; font-weight: 700; font-family: sans-serif; text-decoration: none; border-radius: 8px; display: inline-block;">
+              Télécharger le Reçu Officiel &rarr;
             </a>
           </td>
         </tr>
       </table>
-      `:""}
+      ` : ''}
     </div>
-    ${getEmailFooterHtml(displayStudio,params.replyTo)}
-  `);const text=`
-Re\xE7u de paiement - ${displayStudio}
+    ${getEmailFooterHtml(displayStudio, params.replyTo)}
+  `);
+
+  const text = `
+Reçu de paiement - ${params.studioName || 'Studio'}
 Facture : ${params.invoiceNumber}
-Montant encaiss\xE9 : ${params.amountPaid.toLocaleString("fr-FR",{minimumFractionDigits:2})} \u20AC
-Solde restant : ${params.balanceRemaining.toLocaleString("fr-FR",{minimumFractionDigits:2})} \u20AC
-Merci pour votre r\xE8glement.
-  `.trim();return{subject,html,text}}__name(buildPaymentReceiptEmail,"buildPaymentReceiptEmail");function buildTestEmail(params){const displayStudio=params.studioName||(params.isPlatformTest?"eyes-onwork Plateforme":"Mon Studio");const subject=params.isPlatformTest?`\u2705 Test du Service d\u2019Envoi Plateforme r\xE9ussi \xB7 eyes-onwork`:`\u2705 Test de Notification r\xE9ussi \xB7 ${displayStudio}`;const nowStr=new Date().toLocaleString("fr-FR",{dateStyle:"full",timeStyle:"medium"});const html=wrapEmailContainer(`
-    ${getEmailHeaderHtml("Test de Notification R\xE9ussi",params.isPlatformTest?"V\xE9rification du service d\u2019envoi global":"V\xE9rification de votre adresse de notification",displayStudio)}
+Montant encaissé : ${params.amountPaid.toLocaleString('fr-FR', { minimumFractionDigits: 2 })} €
+Solde restant : ${params.balanceRemaining.toLocaleString('fr-FR', { minimumFractionDigits: 2 })} €
+Merci pour votre règlement.
+  `.trim();
+
+  return { subject, html, text };
+}
+
+export function buildTestEmail(params: {
+  recipientEmail: string;
+  studioName?: string;
+  isPlatformTest?: boolean;
+}): { subject: string; html: string; text: string } {
+  const displayStudio = escapeHtml(params.studioName || (params.isPlatformTest ? 'eyes-onwork Plateforme' : 'Mon Studio'));
+  const subject = params.isPlatformTest ? '✅ Test du Service d’Envoi Plateforme réussi · eyes-onwork' : `✅ Test de Notification réussi · ${params.studioName || 'Studio'}`;
+  const nowStr = new Date().toLocaleString('fr-FR', { dateStyle: 'full', timeStyle: 'medium' });
+
+  const html = wrapEmailContainer(`
+    ${getEmailHeaderHtml('Test de Notification Réussi', params.isPlatformTest ? 'Vérification du service d’envoi global' : 'Vérification de votre adresse de notification', displayStudio)}
     <div class="content-cell" style="padding: 28px 28px 12px 28px; font-family: sans-serif; color: #FFFFFF;">
       <div style="background-color: #142820; border: 1px solid #5FB59A; border-radius: 8px; padding: 18px 20px; margin-bottom: 22px;">
         <span style="font-size: 15px; font-weight: 800; color: #5FB59A; display: block; margin-bottom: 4px;">
-          \u2713 R\xE9ception confirm\xE9e
+          ✓ Réception confirmée
         </span>
         <p style="margin: 0; font-size: 13px; color: #D1FAE5; line-height: 1.5;">
-          ${params.isPlatformTest?"Le service d\u2019envoi transactionnel de la plateforme est op\xE9rationnel.":`Vos notifications pour ${displayStudio} sont parfaitement configur\xE9es et fonctionnelles.`}
+          ${params.isPlatformTest ? 'Le service d’envoi transactionnel de la plateforme est opérationnel.' : `Vos notifications pour ${displayStudio} sont parfaitement configurées et fonctionnelles.`}
         </p>
       </div>
 
@@ -373,19 +947,37 @@ Merci pour votre r\xE8glement.
       </table>
     </div>
     ${getEmailFooterHtml(displayStudio)}
-  `);const text=`
-Test r\xE9ussi - ${displayStudio}
+  `);
+
+  const text = `
+Test réussi - ${params.studioName || 'Studio'}
 Destinataire : ${params.recipientEmail}
 Horodatage : ${nowStr}
 Votre service d'email fonctionne correctement.
-  `.trim();return{subject,html,text}}__name(buildTestEmail,"buildTestEmail");function buildVerificationCodeEmail(params){const displayStudio=escapeHtml(params.studioName||"eyes-onwork");const expiration=params.expirationMinutes||10;const safeCode=escapeHtml(params.code);const subject=`${params.code} est votre code de confirmation eyes-onwork`;const html=wrapEmailContainer(`
-    ${getEmailHeaderHtml("V\xE9rification de votre compte","Confirmation d\u2019adresse email",displayStudio)}
+  `.trim();
+
+  return { subject, html, text };
+}
+
+export function buildVerificationCodeEmail(params: {
+  code: string;
+  recipientEmail: string;
+  studioName?: string;
+  expirationMinutes?: number;
+}): { subject: string; html: string; text: string } {
+  const displayStudio = escapeHtml(params.studioName || 'eyes-onwork');
+  const expiration = params.expirationMinutes || 10;
+  const safeCode = escapeHtml(params.code);
+  const subject = `${params.code} est votre code de confirmation eyes-onwork`;
+
+  const html = wrapEmailContainer(`
+    ${getEmailHeaderHtml('Vérification de votre compte', 'Confirmation d’adresse email', displayStudio)}
     <div class="content-cell" style="padding: 32px 28px; color: #E1E7F5; font-size: 14px; line-height: 1.6;">
       <p style="margin: 0 0 16px 0; color: #FFFFFF; font-size: 16px; font-weight: 600;">
         Bienvenue sur eyes-onwork !
       </p>
       <p style="margin: 0 0 24px 0; color: #8E97AB;">
-        Pour finaliser la cr\xE9ation de votre compte et s\xE9curiser l\u2019acc\xE8s \xE0 votre espace cr\xE9atif, veuillez saisir le code de v\xE9rification ci-dessous :
+        Pour finaliser la création de votre compte et sécuriser l’accès à votre espace créatif, veuillez saisir le code de vérification ci-dessous :
       </p>
 
       <div style="text-align: center; margin: 32px 0;">
@@ -401,37 +993,39 @@ Votre service d'email fonctionne correctement.
 
       <div style="margin: 28px 0 0 0; padding: 16px; background-color: rgba(255, 255, 255, 0.04); border-left: 3px solid #f7c548; border-radius: 6px; font-size: 12px; color: #8E97AB;">
         <p style="margin: 0 0 6px 0; font-weight: 600; color: #FFFFFF;">
-          Mesure de s\xE9curit\xE9 :
+          Mesure de sécurité :
         </p>
         <p style="margin: 0;">
-          Ne transmettez jamais ce code \xE0 un tiers. Si vous n'avez pas cr\xE9\xE9 de compte sur eyes-onwork, vous pouvez ignorer cet email en toute s\xE9curit\xE9.
+          Ne transmettez jamais ce code à un tiers. Si vous n'avez pas créé de compte sur eyes-onwork, vous pouvez ignorer cet email en toute sécurité.
         </p>
       </div>
     </div>
     ${getEmailFooterHtml(displayStudio)}
   `);
+
   const text = `
 Code de confirmation eyes-onwork : ${params.code}
 
 Votre code est valable pendant ${expiration} minutes.
 Pour finaliser la création de votre compte, saisissez ce code sur votre écran de vérification.
   `.trim();
+
   return { subject, html, text };
 }
-__name(buildVerificationCodeEmail, "buildVerificationCodeEmail");
 
-function buildPasswordResetCodeEmail(params: {
+export function buildPasswordResetCodeEmail(params: {
   code: string;
   recipientEmail: string;
   studioName?: string;
   expirationMinutes?: number;
-}) {
-  const displayStudio = escapeHtml(params.studioName || "eyes-onwork");
+}): { subject: string; html: string; text: string } {
+  const displayStudio = escapeHtml(params.studioName || 'eyes-onwork');
   const expiration = params.expirationMinutes || 10;
   const safeCode = escapeHtml(params.code);
   const subject = `${params.code} est votre code de réinitialisation eyes-onwork`;
+
   const html = wrapEmailContainer(`
-    ${getEmailHeaderHtml("Récupération de mot de passe", "Sécurité du studio", displayStudio)}
+    ${getEmailHeaderHtml('Récupération de mot de passe', 'Sécurité du studio', displayStudio)}
     <div class="content-cell" style="padding: 32px 28px; color: #E1E7F5; font-size: 14px; line-height: 1.6;">
       <p style="margin: 0 0 16px 0; color: #FFFFFF; font-size: 16px; font-weight: 600;">
         Demande de réinitialisation de mot de passe
@@ -462,6 +1056,7 @@ function buildPasswordResetCodeEmail(params: {
     </div>
     ${getEmailFooterHtml(displayStudio)}
   `);
+
   const text = `
 Code de réinitialisation eyes-onwork : ${params.code}
 
@@ -470,201 +1065,414 @@ Pour réinitialiser votre mot de passe, saisissez ce code sur votre écran de r�
 
 Si vous n'êtes pas à l'origine de cette demande, ignorez ce message.
   `.trim();
+
   return { subject, html, text };
 }
-__name(buildPasswordResetCodeEmail, "buildPasswordResetCodeEmail");
 
-const verificationCodesStore = new Map<string, {
-  code: string;
-  expiresAt: number;
-  attempts: number;
-  cooldownUntil: number;
-  hourlyCount: number;
-  hourlyResetAt: number;
-  userId?: string;
-  invalidated?: boolean;
-  used?: boolean;
-}>();
+export function buildProviderLinkedAlertEmail(params: {
+  recipientEmail: string;
+  providerName?: string;
+  secureAccountUrl: string;
+  studioName?: string;
+}): { subject: string; html: string; text: string } {
+  const displayStudio = escapeHtml(params.studioName || 'eyes-onwork');
+  const rawProvider = params.providerName || 'Google';
+  const safeProvider = escapeHtml(rawProvider);
+  const safeUrl = sanitizeSafeAppLink(params.secureAccountUrl) || '/?securityAction=secureAccount';
 
-function generateVerificationCode(): string {
+  const headline =
+    rawProvider === 'Google'
+      ? "Google a été relié à votre compte. Ce n'était pas vous ?"
+      : `${safeProvider} a été relié à votre compte. Ce n'était pas vous ?`;
+
+  const plainHeadline =
+    rawProvider === 'Google'
+      ? "Google a été relié à votre compte. Ce n'était pas vous ?"
+      : `${rawProvider} a été relié à votre compte. Ce n'était pas vous ?`;
+
+  const subject =
+    rawProvider === 'Google'
+      ? 'Alerte de sécurité : Google a été relié à votre compte eyes-onwork'
+      : `Alerte de sécurité : ${rawProvider} a été relié à votre compte eyes-onwork`;
+
+  const html = wrapEmailContainer(`
+    ${getEmailHeaderHtml('Alerte de sécurité du compte', 'Nouveau mode de connexion relié', displayStudio)}
+    <div class="content-cell" style="padding: 32px 28px; color: #E1E7F5; font-size: 14px; line-height: 1.6;">
+      <p style="margin: 0 0 16px 0; color: #FFFFFF; font-size: 17px; font-weight: 700;">
+        ${headline}
+      </p>
+      <p style="margin: 0 0 20px 0; color: #8E97AB;">
+        Un nouveau fournisseur de connexion (<strong style="color: #FFFFFF;">${safeProvider}</strong>) vient d'être associé au compte <strong style="color: #FFFFFF;">${escapeHtml(params.recipientEmail)}</strong>.
+      </p>
+
+      <div style="margin: 24px 0; padding: 18px; background-color: rgba(217, 105, 95, 0.12); border: 1px solid rgba(217, 105, 95, 0.35); border-radius: 12px; font-size: 13px; color: #F1F3F8;">
+        <p style="margin: 0 0 14px 0;">
+          Si vous n'êtes pas à l'origine de cette action, déconnectez immédiatement tous vos appareils et changez votre mot de passe :
+        </p>
+        <div style="text-align: center; margin: 18px 0 6px 0;">
+          <a
+            href="${escapeHtml(safeUrl)}"
+            style="display: inline-block; background-color: #f7c548; color: #0f0326; font-weight: 700; font-size: 14px; text-decoration: none; padding: 13px 26px; border-radius: 10px;"
+          >
+            Sécuriser mon compte
+          </a>
+        </div>
+      </div>
+
+      <p style="margin: 20px 0 0 0; font-size: 12px; color: #8E97AB;">
+        Ce lien révoquera instantanément toutes les sessions actives sur vos appareils et vous permettra de définir un nouveau mot de passe. Si vous êtes bien à l'origine de cet ajout, vous pouvez ignorer ce message.
+      </p>
+    </div>
+    ${getEmailFooterHtml(displayStudio)}
+  `);
+
+  const text = `
+${plainHeadline}
+
+Un nouveau fournisseur de connexion (${rawProvider}) a été relié à votre compte ${params.recipientEmail}.
+
+Ce n'était pas vous ? Sécuriser mon compte :
+${safeUrl}
+
+Ce lien déconnectera immédiatement tous vos appareils et vous proposera de changer votre mot de passe.
+  `.trim();
+
+  return { subject, html, text };
+}
+
+export function generateVerificationCode(): string {
   return crypto.randomInt(100000, 1000000).toString();
 }
-__name(generateVerificationCode, "generateVerificationCode");
 
-function issueVerificationCode(email: string, userId?: string): {
+/**
+ * Transaction Simulator pour l'environnement de test local hors cloud.
+ * Assure les MÊMES invariants stricts Firestore (empreinte SHA-256 avec sel, transactionnel, sans clair).
+ */
+const mockFirestoreVerificationDocs = new Map<string, any>();
+
+async function runVerificationTransaction<T>(
+  action: (transaction: {
+    get: (ref: any) => Promise<{ exists: boolean; data: () => any }>;
+    set: (ref: any, data: any) => void;
+    update: (ref: any, data: any) => void;
+  }) => Promise<T>
+): Promise<T> {
+  try {
+    return await adminDb.runTransaction(async (t) => {
+      return await action({
+        get: async (ref: any) => {
+          const snap = await t.get(ref);
+          return { exists: snap.exists, data: () => snap.data() };
+        },
+        set: (ref: any, data: any) => t.set(ref, data),
+        update: (ref: any, data: any) => t.update(ref, data)
+      });
+    });
+  } catch (err: any) {
+    if (isPermissionOrCredentialError(err)) {
+      // Exécute la transaction de façon atomique sur le mock Firestore pour tests sans GCP
+      const stagedWrites: Array<() => void> = [];
+      const mockTx = {
+        get: async (ref: any) => {
+          const docId = typeof ref === 'string' ? ref : (ref?.id || String(ref));
+          const existing = mockFirestoreVerificationDocs.get(docId);
+          return {
+            exists: Boolean(existing),
+            data: () => existing ? { ...existing } : undefined
+          };
+        },
+        set: (ref: any, data: any) => {
+          const docId = typeof ref === 'string' ? ref : (ref?.id || String(ref));
+          stagedWrites.push(() => mockFirestoreVerificationDocs.set(docId, { ...data }));
+        },
+        update: (ref: any, data: any) => {
+          const docId = typeof ref === 'string' ? ref : (ref?.id || String(ref));
+          stagedWrites.push(() => {
+            const current = mockFirestoreVerificationDocs.get(docId) || {};
+            mockFirestoreVerificationDocs.set(docId, { ...current, ...data });
+          });
+        }
+      };
+
+      const result = await action(mockTx);
+      for (const commit of stagedWrites) {
+        commit();
+      }
+      return result;
+    }
+    throw err;
+  }
+}
+
+/**
+ * 1) Émission d'un code de vérification :
+ * - Stocke l'empreinte SHA-256 du code (avec VERIFICATION_SALT) dans Firestore
+ * - Lue et écrite via une transaction
+ * - Aucun stockage en mémoire de code brut
+ * - 10 minutes de validité
+ * - 5 essais max
+ * - 5 envois par heure par utilisateur
+ */
+export async function issueVerificationCode(email: string, userId?: string): Promise<{
   success: boolean;
   code?: string;
   expiresAt?: number;
   error?: string;
   remainingSeconds?: number;
   message?: string;
-} {
+}> {
   const cleanEmail = email.trim().toLowerCase();
+  const docId = (userId || cleanEmail).replace(/[^a-zA-Z0-9_-]/g, '_');
   const now = Date.now();
-  const existing = verificationCodesStore.get(cleanEmail);
-
-  if (existing) {
-    if (now < existing.hourlyResetAt) {
-      if (existing.hourlyCount >= 5) {
-        return {
-          success: false,
-          error: "HOURLY_LIMIT_EXCEEDED",
-          message: "Plafond horaire atteint (5 envois max par heure). Veuillez patienter."
-        };
-      }
-    } else {
-      existing.hourlyCount = 0;
-      existing.hourlyResetAt = now + 60 * 60 * 1000;
-    }
-
-    if (now < existing.cooldownUntil) {
-      const remainingSeconds = Math.ceil((existing.cooldownUntil - now) / 1000);
-      return {
-        success: false,
-        error: "COOLDOWN",
-        remainingSeconds,
-        message: `Veuillez patienter ${remainingSeconds}s avant de redemander un code.`
-      };
-    }
-  }
-
-  const code = generateVerificationCode();
-  const expiresAt = now + 10 * 60 * 1000;
-  const cooldownUntil = now + 60 * 1000;
-  const hourlyCount = (existing && now < existing.hourlyResetAt) ? existing.hourlyCount + 1 : 1;
-  const hourlyResetAt = (existing && now < existing.hourlyResetAt) ? existing.hourlyResetAt : now + 60 * 60 * 1000;
-
-  verificationCodesStore.set(cleanEmail, {
-    code,
-    expiresAt,
-    attempts: 0,
-    cooldownUntil,
-    hourlyCount,
-    hourlyResetAt,
-    userId,
-    invalidated: false,
-    used: false
-  });
 
   try {
-    if (cleanEmail && typeof persistVerificationCodeToFirestore === 'function') {
-      persistVerificationCodeToFirestore(cleanEmail, code, expiresAt, userId);
-    }
-  } catch {}
+    return await runVerificationTransaction(async (transaction) => {
+      const docRef = adminDb.collection('verification_codes').doc(docId);
+      const snap = await transaction.get(docRef);
+      const existing = snap.exists ? snap.data() : null;
 
-  return {
-    success: true,
-    code,
-    expiresAt
-  };
+      if (existing) {
+        // 5 envois par heure par utilisateur
+        const hourlyResetAt = Number(existing.hourlyResetAt) || (now + 60 * 60 * 1000);
+        const hourlyCount = (now < hourlyResetAt) ? (Number(existing.hourlyCount) || 0) : 0;
+
+        if (now < hourlyResetAt && hourlyCount >= 5) {
+          return {
+            success: false,
+            error: 'HOURLY_LIMIT_EXCEEDED',
+            message: 'Plafond horaire atteint (5 envois max par heure). Veuillez patienter.'
+          };
+        }
+
+        // Cooldown de 60 secondes entre deux demandes
+        const cooldownUntil = Number(existing.cooldownUntil) || 0;
+        if (now < cooldownUntil) {
+          const remainingSeconds = Math.ceil((cooldownUntil - now) / 1000);
+          return {
+            success: false,
+            error: 'COOLDOWN',
+            remainingSeconds,
+            message: `Veuillez patienter ${remainingSeconds}s avant de redemander un code.`
+          };
+        }
+      }
+
+      const code = generateVerificationCode();
+      const codeHash = hashVerificationCode(code);
+      const expiresAt = now + 10 * 60 * 1000; // 10 minutes
+      const cooldownUntil = now + 60 * 1000; // 60 secondes
+
+      const hourlyResetAt = (existing && now < Number(existing.hourlyResetAt))
+        ? Number(existing.hourlyResetAt)
+        : now + 60 * 60 * 1000;
+      const hourlyCount = (existing && now < Number(existing.hourlyResetAt))
+        ? (Number(existing.hourlyCount) || 0) + 1
+        : 1;
+
+      transaction.set(docRef, {
+        docId,
+        email: cleanEmail,
+        userId: userId || null,
+        codeHash, // Empreinte SHA-256 + VERIFICATION_SALT
+        expiresAt,
+        cooldownUntil,
+        attempts: 0,
+        maxAttempts: 5,
+        hourlyCount,
+        hourlyResetAt,
+        invalidated: false,
+        used: false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+
+      return {
+        success: true,
+        code,
+        expiresAt
+      };
+    });
+  } catch (err: any) {
+    return {
+      success: false,
+      error: 'TRANSACTION_FAILED',
+      message: 'Erreur lors de l’émission sécurisée du code.'
+    };
+  }
 }
-__name(issueVerificationCode, "issueVerificationCode");
 
-function verifySubmittedCode(email: string, submittedCode: string): {
+/**
+ * 1) Vérification du code soumis :
+ * - Lecture et écriture via transaction Firestore
+ * - Empreinte SHA-256 avec VERIFICATION_SALT
+ * - Comparaison en temps constant (crypto.timingSafeEqual)
+ * - 5 essais maximum (invalidation au 5ème échec)
+ * - Usage unique (scellé dès la première validation réussie)
+ */
+export async function verifySubmittedCode(emailOrId: string, submittedCode: string, userId?: string): Promise<{
   success: boolean;
   verified?: boolean;
   error?: string;
   remainingAttempts?: number;
   message?: string;
-} {
-  const cleanEmail = email.trim().toLowerCase();
-  const cleanCode = submittedCode.trim();
-  const entry = verificationCodesStore.get(cleanEmail);
+}> {
+  const cleanEmail = emailOrId.trim().toLowerCase();
+  const docId = (userId || cleanEmail).replace(/[^a-zA-Z0-9_-]/g, '_');
+  const cleanCode = (submittedCode || '').trim();
   const now = Date.now();
 
-  if (!entry) {
+  if (!cleanCode || !/^\d{6}$/.test(cleanCode)) {
     return {
       success: false,
-      error: "EXPIRED_OR_NOT_FOUND",
-      message: "Code expiré ou inexistant. Veuillez en redemander un nouveau."
+      error: 'INVALID_FORMAT',
+      message: 'Le code doit comporter 6 chiffres.'
     };
   }
 
-  if (entry.used) {
-    return {
-      success: false,
-      error: "ALREADY_USED",
-      message: "Ce code a déjà été utilisé."
-    };
-  }
+  try {
+    return await runVerificationTransaction(async (transaction) => {
+      const docRef = adminDb.collection('verification_codes').doc(docId);
+      const snap = await transaction.get(docRef);
 
-  if (entry.invalidated || now > entry.expiresAt) {
-    return {
-      success: false,
-      error: "EXPIRED_OR_NOT_FOUND",
-      message: "Code expiré ou inexistant. Veuillez en redemander un nouveau."
-    };
-  }
+      if (!snap.exists) {
+        return {
+          success: false,
+          error: 'EXPIRED_OR_NOT_FOUND',
+          message: 'Code expiré ou inexistant. Veuillez en redemander un nouveau.'
+        };
+      }
 
-  if (entry.attempts >= 5) {
-    entry.invalidated = true;
-    return {
-      success: false,
-      error: "MAX_ATTEMPTS",
-      remainingAttempts: 0,
-      message: "Code invalidé après 5 échecs consécutifs."
-    };
-  }
+      const data = snap.data();
 
-  entry.attempts++;
+      // Usage unique
+      if (data.used === true) {
+        return {
+          success: false,
+          error: 'ALREADY_USED',
+          message: 'Ce code a déjà été utilisé.'
+        };
+      }
 
-  if (entry.code !== cleanCode) {
-    if (entry.attempts >= 5) {
-      entry.invalidated = true;
+      // Invalidation ou expiration (10 minutes)
+      if (data.invalidated || now > Number(data.expiresAt)) {
+        return {
+          success: false,
+          error: 'EXPIRED_OR_NOT_FOUND',
+          message: 'Code expiré ou inexistant. Veuillez en redemander un nouveau.'
+        };
+      }
+
+      // Nombre d'essais (max 5)
+      const currentAttempts = (Number(data.attempts) || 0) + 1;
+      if (currentAttempts > (Number(data.maxAttempts) || 5)) {
+        transaction.update(docRef, { invalidated: true });
+        return {
+          success: false,
+          error: 'MAX_ATTEMPTS',
+          remainingAttempts: 0,
+          message: 'Code invalidé suite à 5 tentatives infructueuses.'
+        };
+      }
+
+      // Comparaison en temps constant (crypto.timingSafeEqual)
+      const submittedHash = hashVerificationCode(cleanCode);
+      const storedHash = String(data.codeHash || '');
+
+      const bufSubmitted = Buffer.from(submittedHash, 'hex');
+      const bufStored = Buffer.from(storedHash, 'hex');
+
+      const isMatch = bufSubmitted.length === bufStored.length && crypto.timingSafeEqual(bufSubmitted, bufStored);
+
+      if (!isMatch) {
+        if (currentAttempts >= 5) {
+          transaction.update(docRef, { attempts: currentAttempts, invalidated: true });
+          return {
+            success: false,
+            error: 'MAX_ATTEMPTS',
+            remainingAttempts: 0,
+            message: 'Code invalidé suite à 5 tentatives infructueuses.'
+          };
+        } else {
+          transaction.update(docRef, { attempts: currentAttempts });
+          return {
+            success: false,
+            error: 'INVALID_CODE',
+            remainingAttempts: 5 - currentAttempts,
+            message: `Code incorrect. Il vous reste ${5 - currentAttempts} tentative(s).`
+          };
+        }
+      }
+
+      // Code validé et scellé à usage unique
+      transaction.update(docRef, {
+        attempts: currentAttempts,
+        used: true,
+        verifiedAt: new Date().toISOString()
+      });
+
       return {
-        success: false,
-        error: "MAX_ATTEMPTS",
-        remainingAttempts: 0,
-        message: "Code invalidé suite à 5 tentatives infructueuses."
+        success: true,
+        verified: true,
+        message: 'Code validé avec succès.'
       };
-    }
+    });
+  } catch (err: any) {
     return {
       success: false,
-      error: "INVALID_CODE",
-      remainingAttempts: 5 - entry.attempts,
-      message: `Code incorrect. Il vous reste ${5 - entry.attempts} tentative(s).`
+      error: 'TRANSACTION_FAILED',
+      message: 'Erreur lors de la validation transactionnelle du code.'
     };
   }
-
-  entry.used = true;
-  return {
-    success: true,
-    verified: true,
-    message: "Code validé avec succès."
-  };
 }
-__name(verifySubmittedCode, "verifySubmittedCode");
 
-function getVerificationStatus(email: string): {
+export async function getVerificationStatus(email: string, userId?: string): Promise<{
   hasPendingCode: boolean;
   cooldownSeconds: number;
   hourlyResendsCount: number;
-} {
+}> {
   const cleanEmail = email.trim().toLowerCase();
-  const entry = verificationCodesStore.get(cleanEmail);
+  const docId = (userId || cleanEmail).replace(/[^a-zA-Z0-9_-]/g, '_');
   const now = Date.now();
 
-  if (!entry) {
+  try {
+    const docRef = adminDb.collection('verification_codes').doc(docId);
+    let data: any = null;
+    try {
+      const snap = await docRef.get();
+      if (snap.exists) data = snap.data();
+    } catch (err: any) {
+      if (isPermissionOrCredentialError(err)) {
+        data = mockFirestoreVerificationDocs.get(docId);
+      }
+    }
+
+    if (!data) {
+      return { hasPendingCode: false, cooldownSeconds: 0, hourlyResendsCount: 0 };
+    }
+
+    const hasPendingCode = !data.invalidated && !data.used && now < Number(data.expiresAt);
+    const cooldownSeconds = Math.max(0, Math.ceil(((Number(data.cooldownUntil) || 0) - now) / 1000));
+    const hourlyResendsCount = (now < (Number(data.hourlyResetAt) || 0)) ? (Number(data.hourlyCount) || 0) : 0;
+
     return {
-      hasPendingCode: false,
-      cooldownSeconds: 0,
-      hourlyResendsCount: 0
+      hasPendingCode,
+      cooldownSeconds,
+      hourlyResendsCount
     };
+  } catch {
+    return { hasPendingCode: false, cooldownSeconds: 0, hourlyResendsCount: 0 };
   }
-
-  const hasPendingCode = !entry.invalidated && now < entry.expiresAt;
-  const cooldownSeconds = Math.max(0, Math.ceil((entry.cooldownUntil - now) / 1000));
-  const hourlyResendsCount = now < entry.hourlyResetAt ? entry.hourlyCount : 0;
-
-  return {
-    hasPendingCode,
-    cooldownSeconds,
-    hourlyResendsCount
-  };
 }
-__name(getVerificationStatus, "getVerificationStatus");
 
-async function sendEmailSafe(params: {
+/**
+ * Envoi d'email sécurisé conforme aux exigences :
+ * 2) Destinataire unique validé
+ * 3) Quotas Firestore par workspace vérifiés
+ * 5) Ne renvoie JAMAIS le message d'erreur SMTP au client
+ * 6) Échappement et limitation des liens
+ * 7) Journaux par workspace conservés 90 jours sans IP complète
+ */
+export async function sendEmailSafe(params: {
   to: string;
   subject: string;
   html: string;
@@ -675,6 +1483,8 @@ async function sendEmailSafe(params: {
   replyTo?: string;
   workspaceId?: string;
   ip?: string;
+  clientIp?: string;
+  plan?: string;
 }): Promise<{
   success: boolean;
   mode: 'live' | 'simulation';
@@ -692,23 +1502,60 @@ async function sendEmailSafe(params: {
     studioName = 'Studio Graphique',
     replyTo,
     workspaceId = 'ws_default',
-    ip = '127.0.0.1'
+    ip,
+    clientIp,
+    plan = 'free'
   } = params;
+
+  const rawIp = clientIp || ip || '127.0.0.1';
+
+  // 2) Destinataire : une seule adresse valide, jamais de liste ni de virgule ni de point-virgule
+  let safeRecipient: string;
+  try {
+    safeRecipient = validateSingleRecipient(to);
+  } catch (err: any) {
+    return {
+      success: false,
+      mode: 'simulation',
+      error: err.message
+    };
+  }
+
+  // 3) Quotas quotidien et mensuel par workspace stockés dans Firestore selon le plan
+  const quotaCheck = await checkAndIncrementWorkspaceQuotas(workspaceId, plan);
+  if (!quotaCheck.allowed) {
+    const errorReason = quotaCheck.reason === 'DAILY_LIMIT_EXCEEDED'
+      ? `Plafond quotidien d’envois atteint pour votre formule (${quotaCheck.dailyCount}/${quotaCheck.dailyLimit}).`
+      : `Plafond mensuel d’envois atteint pour votre formule (${quotaCheck.monthlyCount}/${quotaCheck.monthlyLimit}).`;
+
+    return {
+      success: false,
+      mode: 'simulation',
+      error: errorReason
+    };
+  }
 
   updateDailyCounter();
 
-  const logEntry = {
-    id: `email_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+  // 7) Journaux d'envoi par workspace, conservés 90 jours, sans adresse IP complète
+  const now = Date.now();
+  const ninetyDaysMs = 90 * 24 * 60 * 60 * 1000;
+  const maskedIp = maskIpAddress(rawIp); // Pas d'adresse IP complète !
+
+  const logEntry: EmailLogEntry = {
+    id: `email_${now}_${Math.random().toString(36).substring(2, 7)}`,
     workspaceId,
-    recipientEmail: to,
-    recipientName,
-    subject,
+    recipientEmail: safeRecipient,
+    recipientName: escapeHtml(recipientName),
+    subject: escapeHtml(subject),
     templateKey,
-    sentAt: new Date().toISOString(),
-    status: 'delivered' as const,
+    sentAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + ninetyDaysMs).toISOString(),
+    retentionUntilMs: now + ninetyDaysMs,
+    status: 'delivered',
     provider: 'gmail_smtp',
-    ip,
-    studioName
+    ip: maskedIp,
+    studioName: escapeHtml(studioName)
   };
 
   const transporter = getMailTransporter();
@@ -717,11 +1564,13 @@ async function sendEmailSafe(params: {
     logEntry.provider = 'simulation';
     emailLogs.unshift(logEntry);
     if (emailLogs.length > 200) emailLogs.pop();
+
     try {
       if (typeof persistEmailLogInFirestore === 'function') {
         persistEmailLogInFirestore(logEntry);
       }
     } catch {}
+
     return {
       success: true,
       mode: 'simulation',
@@ -734,17 +1583,17 @@ async function sendEmailSafe(params: {
     const from = formatSenderAddress(studioName);
     const info = await transporter.sendMail({
       from,
-      to,
+      to: safeRecipient,
       subject,
       html,
       text: text || subject,
-      replyTo: replyTo || undefined
+      replyTo: replyTo ? validateSingleRecipient(replyTo) : undefined
     });
 
     dailyProviderSentCount++;
-    incrementWorkspaceMonthlyCount(workspaceId);
     emailLogs.unshift(logEntry);
     if (emailLogs.length > 200) emailLogs.pop();
+
     try {
       if (typeof persistEmailLogInFirestore === 'function') {
         persistEmailLogInFirestore(logEntry);
@@ -758,20 +1607,18 @@ async function sendEmailSafe(params: {
       log: logEntry
     };
   } catch (err: any) {
-    logEntry.status = 'bounced' as const;
+    // 5) Ne renvoie jamais le message d'erreur SMTP au client.
+    console.error('[SMTP Transport Error]', err?.message || err);
+
+    logEntry.status = 'bounced';
     emailLogs.unshift(logEntry);
     if (emailLogs.length > 200) emailLogs.pop();
 
     return {
       success: false,
       mode: 'live',
-      error: err.message || "Erreur d'envoi SMTP",
+      error: "Une erreur est survenue lors de l'acheminement de l'email. Veuillez réessayer ultérieurement.",
       log: logEntry
     };
   }
 }
-__name(sendEmailSafe, "sendEmailSafe");
-
-export{buildAdminNotificationEmail,buildClientConfirmationEmail,buildPaymentReceiptEmail,buildTestEmail,buildVerificationCodeEmail,buildPasswordResetCodeEmail,checkEmailRateLimit,checkWorkspaceMonthlyLimit,escapeHtml,formatSenderAddress,generateVerificationCode,getAdminEmail,getEmailLogs,getMailTransporter,getPlatformAdminEmail,getPlatformProviderConfig,getVerificationStatus,incrementWorkspaceMonthlyCount,issueVerificationCode,sendEmailSafe,verifySubmittedCode};
-
-//# sourceMappingURL=data:application/json;base64,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

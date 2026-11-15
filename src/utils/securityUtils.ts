@@ -33,19 +33,31 @@ export function stripHtml(str: string | null | undefined): string {
 export const FORBIDDEN_EXTENSIONS = new Set([
   'exe', 'bat', 'cmd', 'sh', 'php', 'phtml', 'php3', 'php4', 'php5',
   'py', 'pyc', 'pyw', 'js', 'mjs', 'cjs', 'ts', 'vbs', 'vbe', 'wsf',
-  'jar', 'bin', 'msi', 'com', 'scr', 'cpl', 'dll', 'reg', 'hta', 'html', 'htm'
+  'jar', 'bin', 'msi', 'com', 'scr', 'cpl', 'dll', 'reg', 'hta', 'html', 'htm', 'svg'
 ]);
 
 /**
- * Liste blanche des extensions graphiques et documentaires autorisées
+ * Liste blanche des extensions graphiques et documentaires autorisées (hors SVG exécutables)
  */
 export const ALLOWED_EXTENSIONS = new Set([
-  'png', 'jpg', 'jpeg', 'webp', 'svg', 'gif', 'avif',
+  'png', 'jpg', 'jpeg', 'webp', 'gif', 'avif',
   'pdf', 'ai', 'psd', 'eps', 'indd', 'sketch', 'fig',
   'zip', 'rar', '7z', 'tar', 'gz',
   'otf', 'ttf', 'woff', 'woff2',
   'mp4', 'mov', 'txt', 'csv'
 ]);
+
+/**
+ * Construit un chemin de stockage strictement isolé sous /users/{uid}/**
+ */
+export function buildUserStoragePath(
+  userId: string, 
+  category: 'logos' | 'maquettes' | 'deliverables' | 'files' | 'uploads',
+  fileName: string
+): string {
+  const safeName = sanitizeUploadedFileName(fileName);
+  return `users/${userId}/${category}/${Date.now()}_${safeName}`;
+}
 
 /**
  * Nettoie un nom de fichier pour éviter les attaques par traversée de répertoires (Directory Traversal)

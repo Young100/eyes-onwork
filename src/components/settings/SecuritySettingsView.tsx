@@ -1,30 +1,51 @@
 import React, { useState } from 'react';
-import { 
-  ShieldCheck, 
-  KeyRound, 
-  Smartphone, 
-  Laptop, 
-  Clock, 
-  AlertTriangle, 
-  CheckCircle2, 
-  Lock, 
-  LogOut, 
+import {
+  ShieldCheck,
+  KeyRound,
+  Smartphone,
+  Laptop,
+  AlertTriangle,
+  CheckCircle2,
+  LogOut,
   Trash2,
-  Eye,
-  EyeOff
+  Mail,
+  Download,
+  Link2
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { evaluatePasswordStrength, getInitialSecuritySessions } from '../../utils/authSecurity';
-import { SecuritySession, AccountAuditEvent } from '../../types';
+import { SecuritySession } from '../../types';
+import { auth as firebaseAuth } from '../../config/firebase';
+import { ReauthModal } from '../common/ReauthModal';
+
+type PendingSensitiveAction =
+  | null
+  | { type: 'change_password' }
+  | { type: 'change_email' }
+  | { type: 'export_data' }
+  | { type: 'delete_account' };
 
 export const SecuritySettingsView: React.FC = () => {
-  const { auth, reauthenticate, logout, auditLogs } = useApp();
+  const {
+    auth,
+    logout,
+    changeAccountPassword,
+    changeAccountEmail,
+    deleteOwnAccount,
+    revokeAllDevices,
+    linkGoogleFromSettings,
+    performExportFullWorkspaceData
+  } = useApp();
 
-  const [currentPassword, setCurrentPassword] = useState('');
+  // Password state
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [showPasswords, setShowPasswords] = useState(false);
-  const [isChangingPassword, setIsChangingPassword] = useState(false);
+
+  // Email change state
+  const [newEmail, setNewEmail] = useState('');
+
+  // Status banner
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // 2FA state
@@ -32,17 +53,27 @@ export const SecuritySettingsView: React.FC = () => {
   const [show2FASetup, setShow2FASetup] = useState(false);
   const [totpCode, setTotpCode] = useState('');
 
-  // Sessions state
+  // Sessions & provider state
   const [sessions, setSessions] = useState<SecuritySession[]>(getInitialSecuritySessions(auth.uid));
+  const [isRevokingAll, setIsRevokingAll] = useState(false);
+  const [isLinkingGoogle, setIsLinkingGoogle] = useState(false);
 
-  // Account deletion modal state
-  const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
-  const [deleteConfirmationPassword, setDeleteConfirmationPassword] = useState('');
-  const [deleteError, setDeleteError] = useState('');
+  // Sensitive action reauth modal state
+  const [pendingAction, setPendingAction] = useState<PendingSensitiveAction>(null);
+
+  const fbProviders = (firebaseAuth.currentUser?.providerData || []).map(p => p.providerId);
+  const hasPasswordProvider =
+    fbProviders.includes('password') ||
+    (auth.linkedProviders || []).includes('password') ||
+    auth.provider === 'password';
+  const hasGoogleProvider =
+    fbProviders.includes('google.com') ||
+    (auth.linkedProviders || []).includes('google') ||
+    auth.provider === 'google';
 
   const newPasswordStrength = evaluatePasswordStrength(newPassword);
 
-  const handlePasswordChange = async (e: React.FormEvent) => {
+  const handleRequestPasswordChange = (e: React.FormEvent) => {
     e.preventDefault();
     setStatusMessage(null);
 
@@ -56,25 +87,91 @@ export const SecuritySettingsView: React.FC = () => {
       return;
     }
 
-    setIsChangingPassword(true);
-    // Sensitive reauth verification
-    const reauthOk = await reauthenticate(currentPassword);
-    setIsChangingPassword(false);
+    setPendingAction({ type: 'change_password' });
+  };
 
-    if (!reauthOk) {
-      setStatusMessage({ type: 'error', text: 'Le mot de passe actuel est incorrect. Veuillez vérifier.' });
+  const handleRequestEmailChange = (e: React.FormEvent) => {
+    e.preventDefault();
+    setStatusMessage(null);
+    const cleanNew = newEmail.trim().toLowerCase();
+    if (!cleanNew || !cleanNew.includes('@')) {
+      setStatusMessage({ type: 'error', text: 'Veuillez saisir une nouvelle adresse email valide.' });
+      return;
+    }
+    if (cleanNew === (auth.email || '').trim().toLowerCase()) {
+      setStatusMessage({ type: 'error', text: 'La nouvelle adresse doit être différente de votre adresse actuelle.' });
       return;
     }
 
-    setStatusMessage({ type: 'success', text: 'Votre mot de passe a été mis à jour avec succès.' });
-    setCurrentPassword('');
-    setNewPassword('');
-    setConfirmPassword('');
+    setPendingAction({ type: 'change_email' });
   };
 
-  const handleDisconnectOtherSessions = () => {
-    setSessions(prev => prev.filter(s => s.isCurrent));
-    setStatusMessage({ type: 'success', text: 'Toutes les autres sessions actives ont été déconnectées.' });
+  const executePendingSensitiveAction = async () => {
+    if (!pendingAction) return;
+
+    if (pendingAction.type === 'change_password') {
+      const res = await changeAccountPassword(newPassword);
+      if (!res.success) {
+        setStatusMessage({ type: 'error', text: res.error || 'Impossible de mettre à jour le mot de passe.' });
+        return;
+      }
+      setStatusMessage({ type: 'success', text: 'Votre mot de passe a été mis à jour avec succès.' });
+      setNewPassword('');
+      setConfirmPassword('');
+      return;
+    }
+
+    if (pendingAction.type === 'change_email') {
+      const res = await changeAccountEmail(newEmail);
+      if (!res.success) {
+        setStatusMessage({ type: 'error', text: res.error || 'Impossible de modifier votre adresse email.' });
+        return;
+      }
+      setStatusMessage({
+        type: 'success',
+        text: `Un email de confirmation a été envoyé à ${newEmail.trim().toLowerCase()}. Votre adresse sera mise à jour dès validation du lien.`
+      });
+      setNewEmail('');
+      return;
+    }
+
+    if (pendingAction.type === 'export_data') {
+      performExportFullWorkspaceData();
+      setStatusMessage({ type: 'success', text: 'Export intégral de vos données téléchargé avec succès.' });
+      return;
+    }
+
+    if (pendingAction.type === 'delete_account') {
+      const res = await deleteOwnAccount();
+      if (!res.success) {
+        setStatusMessage({ type: 'error', text: res.error || 'Impossible de finaliser la suppression du compte.' });
+      }
+    }
+  };
+
+  const handleLinkGoogle = async () => {
+    setStatusMessage(null);
+    setIsLinkingGoogle(true);
+    const res = await linkGoogleFromSettings();
+    setIsLinkingGoogle(false);
+    if (res.success) {
+      setStatusMessage({
+        type: 'success',
+        text: 'Votre compte Google a été relié. Un email d’avertissement de sécurité vient de vous être envoyé.'
+      });
+    } else {
+      setStatusMessage({ type: 'error', text: res.error || 'Échec de la liaison Google.' });
+    }
+  };
+
+  const handleRevokeAllDevices = async () => {
+    setStatusMessage(null);
+    setIsRevokingAll(true);
+    const res = await revokeAllDevices();
+    setIsRevokingAll(false);
+    if (!res.success) {
+      setStatusMessage({ type: 'error', text: res.error || 'Impossible de déconnecter tous les appareils.' });
+    }
   };
 
   const handleToggle2FA = () => {
@@ -99,66 +196,145 @@ export const SecuritySettingsView: React.FC = () => {
     }
   };
 
-  const handleDeleteAccount = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setDeleteError('');
-
-    const ok = await reauthenticate(deleteConfirmationPassword);
-    if (!ok) {
-      setDeleteError('Mot de passe incorrect. Impossible de confirmer la suppression.');
-      return;
+  const getModalMeta = () => {
+    switch (pendingAction?.type) {
+      case 'change_password':
+        return {
+          title: 'Confirmer le changement de mot de passe',
+          description: 'Pour des raisons de sécurité, veuillez vous ré-authentifier avant d’enregistrer votre nouveau mot de passe.',
+          confirmLabel: 'Valider le mot de passe'
+        };
+      case 'change_email':
+        return {
+          title: 'Confirmer le changement d’adresse email',
+          description: `Une nouvelle authentification est requise avant de modifier votre adresse de connexion vers ${newEmail.trim().toLowerCase()}.`,
+          confirmLabel: 'Confirmer le changement'
+        };
+      case 'export_data':
+        return {
+          title: 'Confirmer l’export des données',
+          description: 'L’export intégral contient vos clients, projets, devis et factures. Veuillez confirmer votre identité avant le téléchargement.',
+          confirmLabel: 'Télécharger l’export'
+        };
+      case 'delete_account':
+        return {
+          title: 'Supprimer définitivement mon compte',
+          description: 'Cette action supprime immédiatement votre compte et toutes vos données associées. Veuillez confirmer votre identité pour continuer.',
+          confirmLabel: 'Supprimer définitivement'
+        };
+      default:
+        return { title: '', description: '', confirmLabel: 'Confirmer' };
     }
-
-    alert('Votre demande de suppression a été enregistrée. Un délai de réflexion de 7 jours s’applique avant la purge définitive.');
-    logout();
   };
+
+  const modalMeta = getModalMeta();
 
   return (
     <div className="space-y-8 animate-fadeIn max-w-4xl">
-      
       {/* Status banner */}
       {statusMessage && (
-        <div className={`p-4 rounded-2xl border text-xs font-semibold flex items-center gap-2 ${
-          statusMessage.type === 'success' 
-            ? 'bg-[#52BE80]/15 border-[#52BE80]/30 text-[#52BE80]' 
-            : 'bg-[#D9695F]/15 border-[#D9695F]/30 text-[#F29B9B]'
-        }`}>
-          {statusMessage.type === 'success' ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <AlertTriangle className="w-4 h-4 shrink-0" />}
+        <div
+          className={`p-4 rounded-2xl border text-xs font-semibold flex items-center gap-2 ${
+            statusMessage.type === 'success'
+              ? 'bg-[#52BE80]/15 border-[#52BE80]/30 text-[#52BE80]'
+              : 'bg-[#D9695F]/15 border-[#D9695F]/30 text-[#F29B9B]'
+          }`}
+        >
+          {statusMessage.type === 'success' ? (
+            <CheckCircle2 className="w-4 h-4 shrink-0" />
+          ) : (
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+          )}
           <span>{statusMessage.text}</span>
         </div>
       )}
 
-      {/* Section 1: Change Password */}
-      <div className="glass-card p-6 sm:p-8 space-y-6">
-        <div className="flex items-center gap-3 pb-4 border-b border-white/10">
-          <div className="p-2.5 rounded-2xl bg-[#f7c548]/15 border border-[#f7c548]/30 text-[#f7c548]">
-            <KeyRound className="w-5 h-5" />
-          </div>
-          <div>
-            <h3 className="text-base font-bold text-white font-display">
-              Modification du Mot de Passe
-            </h3>
-            <p className="text-xs text-[#8E97AB]">
-              Une confirmation de votre mot de passe actuel est requise pour toute modification
-            </p>
+      {/* Section 0: Méthodes de connexion reliées */}
+      <div className="glass-card p-6 sm:p-8 space-y-5">
+        <div className="flex items-center justify-between gap-3 pb-4 border-b border-white/10">
+          <div className="flex items-center gap-3">
+            <div className="p-2.5 rounded-2xl bg-[#f7c548]/15 border border-[#f7c548]/30 text-[#f7c548]">
+              <ShieldCheck className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-base font-bold text-white font-display">
+                Fournisseurs de Connexion Reliés
+              </h3>
+              <p className="text-xs text-[#8E97AB]">
+                Tout ajout de méthode de connexion déclenche un email de sécurité avec révocation d’urgence
+              </p>
+            </div>
           </div>
         </div>
 
-        <form onSubmit={handlePasswordChange} className="space-y-4 max-w-lg">
-          <div>
-            <label className="block text-xs font-medium text-[#8E97AB] mb-1">
-              Mot de passe actuel
-            </label>
-            <input
-              type={showPasswords ? 'text' : 'password'}
-              required
-              value={currentPassword}
-              onChange={(e) => setCurrentPassword(e.target.value)}
-              placeholder="••••••••••••"
-              className="w-full px-3.5 py-2.5 text-xs glass-input"
-            />
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+          <div className="p-4 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-between">
+            <div>
+              <p className="font-bold text-white">Email & mot de passe</p>
+              <p className="text-[11px] text-[#8E97AB]">{auth.email}</p>
+            </div>
+            <span
+              className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
+                hasPasswordProvider ? 'bg-[#52BE80]/20 text-[#52BE80]' : 'bg-white/10 text-[#8E97AB]'
+              }`}
+            >
+              {hasPasswordProvider ? 'Actif' : 'Non défini'}
+            </span>
           </div>
 
+          <div className="p-4 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-between gap-3">
+            <div>
+              <p className="font-bold text-white">Compte Google</p>
+              <p className="text-[11px] text-[#8E97AB]">
+                {hasGoogleProvider ? 'Relié à votre espace studio' : 'Non relié'}
+              </p>
+            </div>
+            {hasGoogleProvider ? (
+              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-[#52BE80]/20 text-[#52BE80]">
+                Relié
+              </span>
+            ) : (
+              <button
+                type="button"
+                onClick={handleLinkGoogle}
+                disabled={isLinkingGoogle}
+                className="py-1.5 px-3 rounded-xl text-[11px] font-bold text-[#0B0F1A] bg-[#f7c548] hover:bg-[#e5b336] transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                <Link2 className="w-3.5 h-3.5" />
+                <span>{isLinkingGoogle ? 'Liaison...' : 'Relier Google'}</span>
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Section 1: Change Password (gated with fresh ReauthModal) */}
+      <div className="glass-card p-6 sm:p-8 space-y-6">
+        <div className="flex items-center justify-between gap-3 pb-4 border-b border-white/10">
+          <div className="flex items-center gap-3">
+            <div className="p-2.5 rounded-2xl bg-[#f7c548]/15 border border-[#f7c548]/30 text-[#f7c548]">
+              <KeyRound className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-base font-bold text-white font-display">
+                {hasPasswordProvider ? 'Modification du Mot de Passe' : 'Définir un Mot de Passe'}
+              </h3>
+              <p className="text-xs text-[#8E97AB]">
+                Une nouvelle authentification (mot de passe ou Google) est exigée avant validation
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setShowPasswords(v => !v)}
+            className="text-xs text-[#8E97AB] hover:text-white cursor-pointer"
+          >
+            {showPasswords ? 'Masquer' : 'Afficher'}
+          </button>
+        </div>
+
+        <form onSubmit={handleRequestPasswordChange} className="space-y-4 max-w-lg">
           <div>
             <label className="block text-xs font-medium text-[#8E97AB] mb-1">
               Nouveau mot de passe (10 caractères min.)
@@ -211,10 +387,49 @@ export const SecuritySettingsView: React.FC = () => {
 
           <button
             type="submit"
-            disabled={isChangingPassword}
             className="py-2.5 px-5 rounded-xl text-xs font-bold text-[#0B0F1A] bg-[#f7c548] hover:bg-[#e5b336] transition-all cursor-pointer"
           >
-            {isChangingPassword ? 'Vérification...' : 'Mettre à jour mon mot de passe'}
+            {hasPasswordProvider ? 'Mettre à jour mon mot de passe' : 'Ajouter un mot de passe'}
+          </button>
+        </form>
+      </div>
+
+      {/* Section 1b: Change Email Address (gated with fresh ReauthModal) */}
+      <div className="glass-card p-6 sm:p-8 space-y-6">
+        <div className="flex items-center gap-3 pb-4 border-b border-white/10">
+          <div className="p-2.5 rounded-2xl bg-[#f7c548]/15 border border-[#f7c548]/30 text-[#f7c548]">
+            <Mail className="w-5 h-5" />
+          </div>
+          <div>
+            <h3 className="text-base font-bold text-white font-display">
+              Changement d’Adresse Email
+            </h3>
+            <p className="text-xs text-[#8E97AB]">
+              Adresse actuelle : <strong className="text-white">{auth.email}</strong> · Ré-authentification obligatoire
+            </p>
+          </div>
+        </div>
+
+        <form onSubmit={handleRequestEmailChange} className="space-y-4 max-w-lg">
+          <div>
+            <label className="block text-xs font-medium text-[#8E97AB] mb-1">
+              Nouvelle adresse email
+            </label>
+            <input
+              type="email"
+              required
+              value={newEmail}
+              onChange={(e) => setNewEmail(e.target.value)}
+              placeholder="nouvelle@adresse.fr"
+              className="w-full px-3.5 py-2.5 text-xs glass-input"
+            />
+          </div>
+
+          <button
+            type="submit"
+            className="py-2.5 px-5 rounded-xl text-xs font-bold text-[#0B0F1A] bg-[#f7c548] hover:bg-[#e5b336] transition-all cursor-pointer"
+          >
+            Modifier mon adresse email
           </button>
         </form>
       </div>
@@ -240,8 +455,8 @@ export const SecuritySettingsView: React.FC = () => {
             type="button"
             onClick={handleToggle2FA}
             className={`py-2 px-4 rounded-xl text-xs font-bold transition-all cursor-pointer ${
-              is2FAEnabled 
-                ? 'bg-[#D9695F]/20 text-[#D9695F] hover:bg-[#D9695F]/30' 
+              is2FAEnabled
+                ? 'bg-[#D9695F]/20 text-[#D9695F] hover:bg-[#D9695F]/30'
                 : 'bg-[#52BE80] text-[#0B0F1A] hover:bg-[#48A870]'
             }`}
           >
@@ -294,7 +509,7 @@ export const SecuritySettingsView: React.FC = () => {
 
       {/* Section 3: Active Sessions & Devices */}
       <div className="glass-card p-6 sm:p-8 space-y-6">
-        <div className="flex items-center justify-between pb-4 border-b border-white/10">
+        <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-white/10">
           <div className="flex items-center gap-3">
             <div className="p-2.5 rounded-2xl bg-white/10 border border-white/20 text-white">
               <Laptop className="w-5 h-5" />
@@ -304,29 +519,30 @@ export const SecuritySettingsView: React.FC = () => {
                 Appareils & Sessions Récentes
               </h3>
               <p className="text-xs text-[#8E97AB]">
-                Consultez les postes actuellement connectés à votre compte studio
+                Révoquez immédiatement l’ensemble des jetons de session sur tous vos appareils
               </p>
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
             <button
+              type="button"
+              onClick={handleRevokeAllDevices}
+              disabled={isRevokingAll}
+              className="py-2 px-3.5 rounded-xl text-xs font-semibold text-white bg-white/10 hover:bg-white/15 border border-white/15 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+            >
+              <LogOut className="w-3.5 h-3.5 text-[#f7c548]" />
+              <span>{isRevokingAll ? 'Révocation...' : 'Déconnecter tous les appareils'}</span>
+            </button>
+
+            <button
+              type="button"
               onClick={logout}
               className="py-2 px-3.5 rounded-xl text-xs font-semibold text-[#D9695F] bg-[#D9695F]/15 hover:bg-[#D9695F]/25 border border-[#D9695F]/30 transition-all flex items-center gap-1.5 cursor-pointer shadow-sm"
-              title="Mettre fin à la session en cours et retourner à la page de connexion"
             >
               <LogOut className="w-3.5 h-3.5" />
               <span>Se déconnecter</span>
             </button>
-
-            {sessions.length > 1 && (
-              <button
-                onClick={handleDisconnectOtherSessions}
-                className="py-2 px-3.5 rounded-xl text-xs font-semibold text-[#8E97AB] hover:text-white bg-white/5 hover:bg-white/10 border border-white/10 transition-all flex items-center gap-1.5 cursor-pointer"
-              >
-                <span>Autres appareils</span>
-              </button>
-            )}
           </div>
         </div>
 
@@ -355,12 +571,10 @@ export const SecuritySettingsView: React.FC = () => {
               </div>
 
               <div className="flex items-center gap-3">
-                <span className="text-[11px] text-[#8E97AB]">
-                  {sess.lastActiveAt}
-                </span>
-
+                <span className="text-[11px] text-[#8E97AB]">{sess.lastActiveAt}</span>
                 {sess.isCurrent && (
                   <button
+                    type="button"
                     onClick={logout}
                     className="py-1.5 px-3 rounded-lg text-xs font-medium text-[#D9695F] hover:bg-[#D9695F]/15 transition-colors flex items-center gap-1 cursor-pointer"
                   >
@@ -374,7 +588,28 @@ export const SecuritySettingsView: React.FC = () => {
         </div>
       </div>
 
-      {/* Section 4: Danger Zone (Account Deletion) */}
+      {/* Section 3b: Data Export (gated with fresh ReauthModal) */}
+      <div className="glass-card p-6 sm:p-8 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+        <div>
+          <h3 className="text-sm font-bold text-white font-display">
+            Export Intégral de vos Données (RGPD)
+          </h3>
+          <p className="text-xs text-[#8E97AB] mt-0.5">
+            Téléchargez vos clients, projets, devis et factures au format JSON après vérification d’identité.
+          </p>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => setPendingAction({ type: 'export_data' })}
+          className="py-2.5 px-4 rounded-xl text-xs font-semibold text-white bg-white/10 hover:bg-white/15 border border-white/20 transition-all flex items-center gap-2 cursor-pointer whitespace-nowrap"
+        >
+          <Download className="w-4 h-4 text-[#f7c548]" />
+          <span>Exporter mes données</span>
+        </button>
+      </div>
+
+      {/* Section 4: Danger Zone (Account Deletion gated with fresh ReauthModal) */}
       <div className="glass-card p-6 sm:p-8 space-y-4 border border-[#D9695F]/30 bg-[#D9695F]/5">
         <div className="flex items-center gap-3 text-[#D9695F]">
           <AlertTriangle className="w-5 h-5 shrink-0" />
@@ -383,10 +618,11 @@ export const SecuritySettingsView: React.FC = () => {
           </h3>
         </div>
         <p className="text-xs text-[#8E97AB] max-w-xl">
-          La suppression de votre compte effacera votre espace de travail, vos projets, devis et factures. Un délai de réflexion de 7 jours est appliqué avant la purge définitive de la base.
+          La suppression de votre compte efface votre compte d’authentification, votre espace de travail, vos clients, projets, devis et factures. Une ré-authentification fraîche est exigée avant exécution.
         </p>
         <button
-          onClick={() => setIsDeleteModalOpen(true)}
+          type="button"
+          onClick={() => setPendingAction({ type: 'delete_account' })}
           className="py-2.5 px-4 rounded-xl text-xs font-bold text-white bg-[#D9695F]/20 hover:bg-[#D9695F]/30 border border-[#D9695F]/40 transition-all cursor-pointer flex items-center gap-2"
         >
           <Trash2 className="w-4 h-4" />
@@ -394,57 +630,15 @@ export const SecuritySettingsView: React.FC = () => {
         </button>
       </div>
 
-      {/* Delete Confirmation Modal */}
-      {isDeleteModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md">
-          <form onSubmit={handleDeleteAccount} className="w-full max-w-md bg-[#0B0F1A] border border-[#D9695F]/40 rounded-3xl p-6 space-y-4 text-white">
-            <h3 className="text-base font-bold text-[#D9695F] flex items-center gap-2">
-              <AlertTriangle className="w-5 h-5" />
-              <span>Confirmation de suppression</span>
-            </h3>
-
-            <p className="text-xs text-[#8E97AB]">
-              Pour valider la suppression définitive de votre compte studio et de toutes les données associées, veuillez confirmer votre identité en saisissant votre mot de passe actuel :
-            </p>
-
-            {deleteError && (
-              <div className="p-3 rounded-xl bg-[#D9695F]/20 text-[#D9695F] text-xs font-medium">
-                {deleteError}
-              </div>
-            )}
-
-            <div>
-              <label className="block text-xs font-medium text-[#8E97AB] mb-1">
-                Mot de passe actuel
-              </label>
-              <input
-                type="password"
-                required
-                value={deleteConfirmationPassword}
-                onChange={(e) => setDeleteConfirmationPassword(e.target.value)}
-                placeholder="••••••••••••"
-                className="w-full px-3.5 py-2.5 text-xs glass-input"
-              />
-            </div>
-
-            <div className="flex gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setIsDeleteModalOpen(false)}
-                className="flex-1 py-2.5 rounded-xl bg-white/5 text-xs text-[#8E97AB]"
-              >
-                Annuler
-              </button>
-              <button
-                type="submit"
-                className="flex-1 py-2.5 rounded-xl bg-[#D9695F] text-white font-bold text-xs"
-              >
-                Confirmer la suppression
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
+      {/* Unified Reauthentication Modal for all 4 sensitive actions */}
+      <ReauthModal
+        isOpen={pendingAction !== null}
+        title={modalMeta.title}
+        description={modalMeta.description}
+        confirmLabel={modalMeta.confirmLabel}
+        onClose={() => setPendingAction(null)}
+        onAuthenticated={executePendingSensitiveAction}
+      />
     </div>
   );
 };

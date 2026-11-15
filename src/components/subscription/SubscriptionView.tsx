@@ -22,6 +22,7 @@ import { UpgradeModal } from './UpgradeModal';
 import { DEFAULT_PLANS } from '../../data/plansAndWorkspaces';
 import { formatCurrencySafe } from '../../utils/formatUtils';
 import { generateSubscriptionInvoicePDF, SubscriptionInvoiceData } from '../../utils/pdfGenerator';
+import { ReauthModal } from '../common/ReauthModal';
 
 export const SubscriptionView: React.FC = () => {
   const { 
@@ -30,13 +31,14 @@ export const SubscriptionView: React.FC = () => {
     openUpgradeModal, 
     isUpgradeModalOpen, 
     closeUpgradeModal,
-    exportFullWorkspaceData,
+    performExportFullWorkspaceData,
     profile
   } = useApp();
 
   const [toastNotice, setToastNotice] = useState<string | null>(null);
   const [downloadingInvoiceId, setDownloadingInvoiceId] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [isExportReauthOpen, setIsExportReauthOpen] = useState(false);
 
   const plan = (DEFAULT_PLANS as any)[currentWorkspace.planId] || Object.values(DEFAULT_PLANS)[0];
   const isPro = currentWorkspace.planId === 'pro' && currentWorkspace.planStatus === 'active';
@@ -413,13 +415,25 @@ export const SubscriptionView: React.FC = () => {
         </div>
 
         <button
-          onClick={exportFullWorkspaceData}
+          onClick={() => setIsExportReauthOpen(true)}
           className="py-2.5 px-4 rounded-xl text-xs font-semibold text-white bg-white/10 hover:bg-white/15 border border-white/20 transition-all flex items-center gap-2 cursor-pointer whitespace-nowrap"
         >
           <Download className="w-4 h-4 text-[#f7c548]" />
           <span>Exporter mes données</span>
         </button>
       </div>
+
+      <ReauthModal
+        isOpen={isExportReauthOpen}
+        title="Confirmer l'export des données"
+        description="L'export intégral contient vos clients, projets, devis et factures. Une ré-authentification est requise avant le téléchargement."
+        confirmLabel="Exporter mes données"
+        onClose={() => setIsExportReauthOpen(false)}
+        onAuthenticated={() => {
+          performExportFullWorkspaceData();
+          showToast('Export intégral téléchargé avec succès.');
+        }}
+      />
 
       {/* Upgrade modal */}
       <UpgradeModal

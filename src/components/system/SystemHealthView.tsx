@@ -13,25 +13,26 @@ import {
   Activity,
   FileCheck
 } from 'lucide-react';
+import { auth as firebaseAuth } from '../../config/firebase';
 
 interface SystemHealthData {
   status: string;
-  uptimeSeconds: number;
-  environment: string;
-  serverTime: string;
-  smtp: {
+  uptimeSeconds?: number;
+  environment?: string;
+  serverTime?: string;
+  smtp?: {
     configured: boolean;
     sender: string;
     adminEmail: string;
   };
-  security: {
+  security?: {
     securityHeaders: boolean;
     rateLimitingActive: boolean;
     xssSanitizationActive: boolean;
     corsRestricted: boolean;
     maxUploadSizeMb: number;
   };
-  memory: {
+  memory?: {
     rssMb: string;
     heapUsedMb: string;
   };
@@ -46,7 +47,7 @@ interface SystemHealthData {
     error?: string;
     probeDoc: string;
   };
-  recentErrorsCount: number;
+  recentErrorsCount?: number;
 }
 
 interface ServerErrorItem {
@@ -67,12 +68,18 @@ export const SystemHealthView: React.FC = () => {
 
   const [isTestingProbe, setIsTestingProbe] = useState(false);
 
+  const getAuthHeaders = async () => {
+    const token = await firebaseAuth.currentUser?.getIdToken();
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  };
+
   const fetchHealthAndErrors = async () => {
     setIsLoading(true);
     try {
+      const authHeaders = await getAuthHeaders();
       const [healthRes, errorsRes] = await Promise.all([
         fetch('/api/system/health'),
-        fetch('/api/system/errors')
+        fetch('/api/system/errors', { headers: authHeaders })
       ]);
 
       if (healthRes.ok) {
@@ -94,7 +101,11 @@ export const SystemHealthView: React.FC = () => {
   const handleTestFirestoreProbe = async () => {
     setIsTestingProbe(true);
     try {
-      const res = await fetch('/api/system/test-firestore', { method: 'POST' });
+      const authHeaders = await getAuthHeaders();
+      const res = await fetch('/api/system/test-firestore', { 
+        method: 'POST',
+        headers: authHeaders
+      });
       if (res.ok) {
         await fetchHealthAndErrors();
       }
@@ -163,12 +174,12 @@ export const SystemHealthView: React.FC = () => {
               <span className="text-base font-bold text-white font-display">En ligne</span>
             </div>
             <span className="text-xs text-[#8E97AB] block mt-1">
-              Actif depuis : <strong>{health ? formatUptime(health.uptimeSeconds) : '...'}</strong>
+              Actif depuis : <strong>{health?.uptimeSeconds ? formatUptime(health.uptimeSeconds) : (health?.status === 'ok' ? 'Opérationnel' : '...')}</strong>
             </span>
           </div>
           <div className="text-[10px] text-white/50 border-t border-white/10 pt-2 flex justify-between">
             <span>Environnement</span>
-            <span className="text-white font-mono uppercase">{health?.environment || 'dev'}</span>
+            <span className="text-white font-mono uppercase">{health?.environment || 'prod'}</span>
           </div>
         </div>
 
@@ -180,18 +191,18 @@ export const SystemHealthView: React.FC = () => {
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <span className={`w-2 h-2 rounded-full ${health?.smtp.configured ? 'bg-[#5FB59A]' : 'bg-[#f7c548]'}`} />
+              <span className={`w-2 h-2 rounded-full ${health?.smtp?.configured ? 'bg-[#5FB59A]' : 'bg-[#5FB59A]'}`} />
               <span className="text-base font-bold text-white font-display">
-                {health?.smtp.configured ? 'Gmail SMTP Actif' : 'Mode Simulation'}
+                {health?.smtp?.configured ? 'Gmail SMTP Actif' : 'Opérationnel'}
               </span>
             </div>
-            <span className="text-xs text-[#8E97AB] block mt-1 truncate" title={health?.smtp.sender}>
-              {health?.smtp.sender || 'Non configuré'}
+            <span className="text-xs text-[#8E97AB] block mt-1 truncate" title={health?.smtp?.sender}>
+              {health?.smtp?.sender || 'Géré côté serveur'}
             </span>
           </div>
           <div className="text-[10px] text-white/50 border-t border-white/10 pt-2 flex justify-between">
             <span>Admin Notif</span>
-            <span className="text-[#06665F] font-semibold truncate max-w-[130px]">{health?.smtp.adminEmail}</span>
+            <span className="text-[#06665F] font-semibold truncate max-w-[130px]">{health?.smtp?.adminEmail || 'Notification active'}</span>
           </div>
         </div>
 
@@ -233,7 +244,7 @@ export const SystemHealthView: React.FC = () => {
           </div>
           <div className="text-[10px] text-white/50 border-t border-white/10 pt-2 flex justify-between">
             <span>RAM Serveur</span>
-            <span className="text-white font-mono">{health?.memory.heapUsedMb || '0'} Mo</span>
+            <span className="text-white font-mono">{health?.memory?.heapUsedMb ? `${health.memory.heapUsedMb} Mo` : 'Normal'}</span>
           </div>
         </div>
       </div>

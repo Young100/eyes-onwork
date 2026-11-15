@@ -97,55 +97,140 @@ export function evaluatePasswordStrength(password: string): PasswordStrengthResu
   };
 }
 
-// Suivi anti-brute force des tentatives de connexion en mémoire locale
+// Suivi anti-brute force avec délai croissant après échecs (en plus de la limite Firebase)
 const LOGIN_ATTEMPTS_KEY = 'eyesonwork_login_attempts';
-const MAX_ATTEMPTS = 5;
-const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 minutes
+const GLOBAL_ATTEMPTS_IDENTIFIER = '__global__';
+// Barème du délai croissant en secondes : 1er échec = 0s, 2e = 3s, 3e = 10s, 4e = 30s, 5e = 60s, 6e = 180s, 7e = 300s, 8e+ = 900s
+export const ESCALATING_DELAY_SECONDS = [0, 3, 10, 30, 60, 180, 300, 900];
 
 export interface LoginAttemptState {
   attempts: number;
   lockedUntil?: number;
 }
 
-export function checkLoginRateLimit(identifier: string): { isLocked: boolean; waitMinutes?: number } {
+export function getEscalatingDelayForAttempt(attemptCount: number): number {
+  if (attemptCount <= 0) return 0;
+  const idx = Math.min(attemptCount - 1, ESCALATING_DELAY_SECONDS.length - 1);
+  return ESCALATING_DELAY_SECONDS[idx];
+}
+
+export function formatDelayDuration(totalSeconds: number): string {
+  const secs = Math.max(0, Math.ceil(totalSeconds));
+  if (secs < 60) {
+    return `${secs} seconde${secs > 1 ? 's' : ''}`;
+  }
+  const minutes = Math.floor(secs / 60);
+  const remSeconds = secs % 60;
+  if (remSeconds === 0) {
+    return `${minutes} minute${minutes > 1 ? 's' : ''}`;
+  }
+  return `${minutes} min ${remSeconds}s`;
+}
+
+function readAttemptState(key: string): LoginAttemptState {
   try {
-    const raw = localStorage.getItem(`${LOGIN_ATTEMPTS_KEY}_${identifier}`);
-    if (!raw) return { isLocked: false };
-    const state: LoginAttemptState = JSON.parse(raw);
-    const now = Date.now();
-    if (state.lockedUntil && state.lockedUntil > now) {
-      const waitMinutes = Math.ceil((state.lockedUntil - now) / (60 * 1000));
-      return { isLocked: true, waitMinutes };
-    }
-    return { isLocked: false };
+    const raw = localStorage.getItem(key);
+    if (!raw) return { attempts: 0 };
+    const parsed = JSON.parse(raw);
+    return {
+      attempts: typeof parsed?.attempts === 'number' ? parsed.attempts : 0,
+      lockedUntil: typeof parsed?.lockedUntil === 'number' ? parsed.lockedUntil : undefined
+    };
   } catch {
-    return { isLocked: false };
+    return { attempts: 0 };
   }
 }
 
-export function recordFailedLoginAttempt(identifier: string): { isNowLocked: boolean; waitMinutes?: number } {
+export function checkLoginRateLimit(identifier: string): {
+  isLocked: boolean;
+  remainingSeconds: number;
+  waitMinutes?: number;
+  attempts: number;
+} {
   try {
-    const key = `${LOGIN_ATTEMPTS_KEY}_${identifier}`;
-    const raw = localStorage.getItem(key);
-    const state: LoginAttemptState = raw ? JSON.parse(raw) : { attempts: 0 };
-    state.attempts += 1;
+    const cleanId = (identifier || '').trim().toLowerCase() || GLOBAL_ATTEMPTS_IDENTIFIER;
+    const perUserState = readAttemptState(`${LOGIN_ATTEMPTS_KEY}_${cleanId}`);
+    const globalState = readAttemptState(`${LOGIN_ATTEMPTS_KEY}_${GLOBAL_ATTEMPTS_IDENTIFIER}`);
+    const now = Date.now();
 
-    if (state.attempts >= MAX_ATTEMPTS) {
-      state.lockedUntil = Date.now() + LOCKOUT_DURATION_MS;
-      localStorage.setItem(key, JSON.stringify(state));
-      return { isNowLocked: true, waitMinutes: 15 };
+    const perUserRem = perUserState.lockedUntil && perUserState.lockedUntil > now
+      ? Math.ceil((perUserState.lockedUntil - now) / 1000)
+      : 0;
+    const globalRem = globalState.lockedUntil && globalState.lockedUntil > now
+      ? Math.ceil((globalState.lockedUntil - now) / 1000)
+      : 0;
+
+    const remainingSeconds = Math.max(perUserRem, globalRem);
+    const attempts = Math.max(perUserState.attempts, globalState.attempts);
+
+    if (remainingSeconds > 0) {
+      return {
+        isLocked: true,
+        remainingSeconds,
+        waitMinutes: Math.ceil(remainingSeconds / 60),
+        attempts
+      };
+    }
+    return { isLocked: false, remainingSeconds: 0, attempts };
+  } catch {
+    return { isLocked: false, remainingSeconds: 0, attempts: 0 };
+  }
+}
+
+export function recordFailedLoginAttempt(
+  identifier: string,
+  minDelaySeconds: number = 0
+): {
+  isNowLocked: boolean;
+  delaySeconds: number;
+  remainingSeconds: number;
+  waitMinutes?: number;
+  attempts: number;
+} {
+  try {
+    const cleanId = (identifier || '').trim().toLowerCase() || GLOBAL_ATTEMPTS_IDENTIFIER;
+    const userKey = `${LOGIN_ATTEMPTS_KEY}_${cleanId}`;
+    const globalKey = `${LOGIN_ATTEMPTS_KEY}_${GLOBAL_ATTEMPTS_IDENTIFIER}`;
+
+    const userState = readAttemptState(userKey);
+    const globalState = readAttemptState(globalKey);
+
+    userState.attempts += 1;
+    globalState.attempts += 1;
+
+    const userDelay = getEscalatingDelayForAttempt(userState.attempts);
+    const globalDelay = getEscalatingDelayForAttempt(globalState.attempts);
+    const delaySeconds = Math.max(userDelay, globalDelay, minDelaySeconds);
+
+    const now = Date.now();
+    if (delaySeconds > 0) {
+      const lockedUntil = now + delaySeconds * 1000;
+      userState.lockedUntil = Math.max(userState.lockedUntil || 0, lockedUntil);
+      globalState.lockedUntil = Math.max(globalState.lockedUntil || 0, lockedUntil);
     }
 
-    localStorage.setItem(key, JSON.stringify(state));
-    return { isNowLocked: false };
+    localStorage.setItem(userKey, JSON.stringify(userState));
+    localStorage.setItem(globalKey, JSON.stringify(globalState));
+
+    return {
+      isNowLocked: delaySeconds > 0,
+      delaySeconds,
+      remainingSeconds: delaySeconds,
+      waitMinutes: delaySeconds > 0 ? Math.ceil(delaySeconds / 60) : undefined,
+      attempts: Math.max(userState.attempts, globalState.attempts)
+    };
   } catch {
-    return { isNowLocked: false };
+    return { isNowLocked: false, delaySeconds: 0, remainingSeconds: 0, attempts: 1 };
   }
 }
 
 export function resetLoginAttempts(identifier: string): void {
   try {
-    localStorage.removeItem(`${LOGIN_ATTEMPTS_KEY}_${identifier}`);
+    const cleanId = (identifier || '').trim().toLowerCase();
+    if (cleanId) {
+      localStorage.removeItem(`${LOGIN_ATTEMPTS_KEY}_${cleanId}`);
+    }
+    localStorage.removeItem(`${LOGIN_ATTEMPTS_KEY}_${GLOBAL_ATTEMPTS_IDENTIFIER}`);
   } catch {
     // ignore
   }

@@ -102,6 +102,42 @@ export const ClientPortalView: React.FC<ClientPortalViewProps> = ({
   const [reviewComment, setReviewComment] = useState('');
   const [reviewSubmitted, setReviewSubmitted] = useState(false);
 
+  // Deliverable signed URL download state
+  const [isDownloadingDeliverables, setIsDownloadingDeliverables] = useState(false);
+  const [deliverableDownloadError, setDeliverableDownloadError] = useState<string | null>(null);
+
+  const handleDownloadDeliverablesPack = async () => {
+    const tokenToUse = shareToken || project?.clientShareToken;
+    if (!tokenToUse) return;
+    setIsDownloadingDeliverables(true);
+    setDeliverableDownloadError(null);
+    try {
+      const res = await fetch('/api/portal/deliverables/signed-url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: tokenToUse })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setDeliverableDownloadError(data.message || 'Livrables verrouillés : le solde final doit être réglé.');
+        return;
+      }
+      // Téléchargement via l'URL signée générée par le serveur après vérification du paiement
+      const a = document.createElement('a');
+      a.href = data.signedUrl;
+      a.download = data.fileName || `Livrables_${project.title.toLowerCase().replace(/[^a-z0-9]/g, '_')}.zip`;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch {
+      setDeliverableDownloadError('Erreur de connexion au serveur de fichiers sécurisé.');
+    } finally {
+      setIsDownloadingDeliverables(false);
+    }
+  };
+
   const imageContainerRef = useRef<HTMLDivElement | null>(null);
 
   if (!project) {
@@ -924,21 +960,21 @@ export const ClientPortalView: React.FC<ClientPortalViewProps> = ({
                   </div>
 
                   <button
-                    onClick={() => {
-                      const blob = new Blob([`Pack complet des livrables pour ${project.title}`], { type: 'application/zip' });
-                      const url = URL.createObjectURL(blob);
-                      const a = document.createElement('a');
-                      a.href = url;
-                      a.download = `Livrables_${project.title.toLowerCase().replace(/[^a-z0-9]/g, '_')}.zip`;
-                      a.click();
-                      URL.revokeObjectURL(url);
-                    }}
-                    className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold text-[#0B0F1A] bg-[#5FB59A] hover:bg-[#6ecbb0] transition-colors cursor-pointer shadow-md"
+                    onClick={handleDownloadDeliverablesPack}
+                    disabled={isDownloadingDeliverables}
+                    className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold text-[#0B0F1A] bg-[#5FB59A] hover:bg-[#6ecbb0] transition-colors cursor-pointer shadow-md disabled:opacity-50"
                   >
-                    <Download className="w-4 h-4" />
-                    <span>Tout télécharger (.ZIP)</span>
+                    <Download className={`w-4 h-4 ${isDownloadingDeliverables ? 'animate-bounce' : ''}`} />
+                    <span>{isDownloadingDeliverables ? 'Vérification & URL signée...' : 'Tout télécharger (.ZIP)'}</span>
                   </button>
                 </div>
+
+                {deliverableDownloadError && (
+                  <div className="p-3.5 rounded-xl bg-[#D9695F]/15 border border-[#D9695F]/30 text-xs text-[#D9695F] flex items-center justify-between gap-2 font-medium">
+                    <span>{deliverableDownloadError}</span>
+                    <button onClick={() => setDeliverableDownloadError(null)} className="underline cursor-pointer">Fermer</button>
+                  </div>
+                )}
 
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <div className="p-4 rounded-xl bg-white/[0.03] border border-white/10 space-y-2">

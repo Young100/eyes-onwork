@@ -27,6 +27,7 @@ import {
   RotateCcw
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { auth } from '../../config/firebase';
 import { Quote, Invoice, QuoteStatus, InvoiceStatus } from '../../types';
 import { DocumentA4Modal } from './DocumentA4Modal';
 import { CreateQuoteModal } from './CreateQuoteModal';
@@ -138,9 +139,13 @@ export const BillingView: React.FC<BillingViewProps> = ({ onSelectProject, onSel
         workspaceId: quote?.workspaceId || 'ws_default'
       };
 
+      const idToken = await auth.currentUser?.getIdToken();
       const resp = await fetch('/api/email/send-confirmation', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(idToken ? { 'Authorization': `Bearer ${idToken}` } : {})
+        },
         body: JSON.stringify(payload)
       });
       const data = await resp.json().catch(() => ({}));
@@ -220,9 +225,13 @@ export const BillingView: React.FC<BillingViewProps> = ({ onSelectProject, onSel
         workspaceId: invoice?.workspaceId || 'ws_default'
       };
 
+      const idToken = await auth.currentUser?.getIdToken();
       const resp = await fetch('/api/email/send-confirmation', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(idToken ? { 'Authorization': `Bearer ${idToken}` } : {})
+        },
         body: JSON.stringify(payload)
       });
       const data = await resp.json().catch(() => ({}));

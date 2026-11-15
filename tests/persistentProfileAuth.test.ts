@@ -52,10 +52,10 @@ async function runPersistentProfileTests() {
 
   // 2. Vérification par code à 6 chiffres
   console.log('\n2. Validation par code email & Scellement serveur :');
-  const codeIssue = issueVerificationCode(testEmail, user.uid);
+  const codeIssue = await issueVerificationCode(testEmail, user.uid);
   assert(codeIssue.code, 'Un code doit être émis');
 
-  const verifyRes = verifySubmittedCode(testEmail, codeIssue.code);
+  const verifyRes = await verifySubmittedCode(testEmail, codeIssue.code, user.uid);
   assert.strictEqual(verifyRes.success, true, 'Le code soumis doit être valide');
 
   user = markEmailVerified(testEmail);
@@ -153,5 +153,11 @@ async function runPersistentProfileTests() {
   console.log('==================================================================');
 }
 
-runPersistentProfileTests();
-process.exit(0);
+runPersistentProfileTests()
+  .then(() => {
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error('Test error:', err);
+    process.exit(1);
+  });

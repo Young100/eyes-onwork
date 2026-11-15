@@ -35,37 +35,24 @@ export const EmailPreviewModal: React.FC<EmailPreviewModalProps> = ({
     setStatusMessage(null);
 
     try {
-      const resp = await fetch('/api/email/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          to,
-          recipientName,
-          subject,
-          text: content,
-          templateKey
-        })
-      });
-
-      const data = await resp.json();
-      if (resp.ok) {
-        setStatusMessage({
-          type: 'success',
-          text: data.mode === 'live' 
-            ? `Email envoyé avec succès via Gmail SMTP à ${to} !`
-            : `Email simulé avec succès pour ${to} (mode local test).`
-        });
-        setTimeout(() => {
-          onSent?.();
-          onClose();
-        }, 2000);
-      } else {
-        throw new Error(data.error || 'Erreur lors de l’envoi');
+      if (navigator.clipboard) {
+        await navigator.clipboard.writeText(content);
       }
+      const mailto = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(content)}`;
+      window.location.href = mailto;
+
+      setStatusMessage({
+        type: 'success',
+        text: `Email ouvert dans votre messagerie et copié pour ${to} !`
+      });
+      setTimeout(() => {
+        onSent?.();
+        onClose();
+      }, 1500);
     } catch (err: any) {
       setStatusMessage({
         type: 'error',
-        text: err.message || 'Impossible de joindre le serveur d’envoi'
+        text: err.message || 'Impossible d\'ouvrir la messagerie.'
       });
     } finally {
       setIsSending(false);

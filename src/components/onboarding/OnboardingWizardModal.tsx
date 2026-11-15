@@ -17,6 +17,7 @@ import {
   Loader2
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { auth } from '../../config/firebase';
 import { COUNTRY_PRESETS } from '../../data/countryPresets';
 
 interface OnboardingWizardModalProps {
@@ -69,9 +70,13 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({ is
     setIsSendingTest(true);
     setTestEmailStatus(null);
     try {
+      const idToken = await auth.currentUser?.getIdToken();
       const resp = await fetch('/api/email/test', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          ...(idToken ? { 'Authorization': `Bearer ${idToken}` } : {})
+        },
         body: JSON.stringify({ to: formData.email || profile.email })
       });
       const data = await resp.json();

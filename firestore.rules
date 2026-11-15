@@ -3,15 +3,24 @@ service cloud.firestore {
   match /databases/{database}/documents {
 
     // =========================================================================
-    // FONCTIONS D'AIDE & CONTRÔLE D'ACCÈS ZERO-TRUST
+    // FONCTIONS D'AIDE & CONTRÔLE D'ACCÈS ZERO-TRUST DURCI
     // =========================================================================
 
     function isAuthenticated() {
       return request.auth != null && request.auth.uid != null;
     }
 
+    // Invariant fondamental : toute écriture exige impérativement que l'email soit vérifié
+    function isEmailVerified() {
+      return isAuthenticated() && request.auth.token.email_verified == true;
+    }
+
     function isOwner(ownerId) {
       return isAuthenticated() && request.auth.uid == ownerId;
+    }
+
+    function isOwnerAndVerified(ownerId) {
+      return isEmailVerified() && request.auth.uid == ownerId;
     }
 
     // Le rôle Super Administrateur est validé exclusivement par Custom Claim Firebase Auth
@@ -24,57 +33,124 @@ service cloud.firestore {
       );
     }
 
+    // Contrôle d'appartenance relationnelle : clientId doit appartenir au même propriétaire
+    function clientBelongsToOwner(cId, ownerUid) {
+      return cId == null || cId == '' || 
+        get(/databases/$(database)/documents/clients/$(cId)).data.ownerId == ownerUid;
+    }
+
+    // Contrôle d'appartenance relationnelle : projectId doit appartenir au même propriétaire
+    function projectBelongsToOwner(pId, ownerUid) {
+      return pId == null || pId == '' || 
+        get(/databases/$(database)/documents/projects/$(pId)).data.ownerId == ownerUid;
+    }
+
     // =========================================================================
     // 1. PROFILS UTILISATEURS (/users/{uid})
     // =========================================================================
-    // - Lecture et écriture seulement si request.auth.uid == uid (ou superadmin)
-    // - Les champs sensibles (role, plan, emailVerified, workspaceId, termsAcceptedVersion)
-    //   ne sont JAMAIS modifiables par le client : seul le serveur (Admin SDK) les écrit.
+    // - Lecture : l'utilisateur lui-même ou super admin
+    // - Création : email vérifié, interdiction absolue des champs sensibles (rôle, plan, etc.)
+    // - Mise à jour : liste blanche stricte via affectedKeys().hasOnly()
+    // - Suppression : super admin uniquement (avec email vérifié)
     match /users/{userId} {
       allow read: if isAuthenticated() && (request.auth.uid == userId || isSuperAdmin());
       
-      // À la création, interdiction absolue des clés sensibles (seul le serveur Admin SDK les initialise)
-      allow create: if isAuthenticated() && request.auth.uid == userId &&
+      allow create: if isEmailVerified() && request.auth.uid == userId &&
         !request.resource.data.keys().hasAny([
           'role',
           'plan',
+          'planId',
           'emailVerified',
           'workspaceId',
           'termsAcceptedVersion',
+          'termsAcceptedAt',
+          'privacyAcceptedVersion',
+          'privacyAcceptedAt',
+          'onboardingCompleted',
+          'onboardingCompletedAt',
           'isSuperAdmin',
           'admin'
         ]);
 
-      // À la mise à jour, protection stricte contre toute modification de ces clés par le client
-      allow update: if isAuthenticated() && (
+      // Liste blanche stricte des champs modifiables par le client
+      allow update: if isEmailVerified() && (
         isSuperAdmin() ||
         (
           request.auth.uid == userId &&
-          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-            'role', 
-            'plan', 
-            'emailVerified', 
-            'workspaceId', 
-            'termsAcceptedVersion',
-            'isSuperAdmin',
-            'admin'
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'name',
+            'displayName',
+            'studioName',
+            'phone',
+            'address',
+            'siret',
+            'tvaNumber',
+            'website',
+            'avatarUrl',
+            'photoURL',
+            'photo',
+            'iban',
+            'bic',
+            'currency',
+            'defaultVatRate',
+            'vatRate',
+            'defaultDepositPercent',
+            'defaultTurnaroundWeeks',
+            'defaultRevisionLimit',
+            'termsTemplate',
+            'legalNoticeTemplate',
+            'legalNotice',
+            'defaultConditionsQuote',
+            'depositCalculation',
+            'quotePrefix',
+            'invoicePrefix',
+            'maxFileSizeMb',
+            'messageTemplates',
+            'brandColor',
+            'autoUnlockDeliveryOnFullPayment',
+            'defaultProjectTemplateId',
+            'logoUrl',
+            'specialty',
+            'accentColor',
+            'countryCode',
+            'timezone',
+            'updatedAt',
+            'language',
+            'lang',
+            'preferences',
+            'theme',
+            'showHelpBubbles',
+            'legalNoticesByCountry',
+            'bio'
           ])
         )
       );
 
-      allow delete: if isSuperAdmin();
+      allow delete: if isEmailVerified() && isSuperAdmin();
     }
 
     // =========================================================================
-    // 2. DONNÉES D'UN WORKSPACE (ACCÈS PROPRIÉTAIRE UNIQUEMENT)
+    // 2. ESPACES DE TRAVAIL (/workspaces/{workspaceId})
     // =========================================================================
-    // Accès seulement si l'utilisateur en est le propriétaire légitime (resource.data.ownerId == request.auth.uid).
-
-    // Espaces de travail : interdiction au client de modifier ownerId, plan et limites
+    // - Création : interdiction stricte de planId, plan, planStatus, trialEndsAt, storageLimitMb, membersLimit
+    // - Mise à jour : ownerId inaltérable, quotas et plan inaltérables par le client
     match /workspaces/{workspaceId} {
       allow read: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin());
-      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
-      allow update: if isAuthenticated() && (
+      
+      allow create: if isOwnerAndVerified(request.resource.data.ownerId) &&
+        !request.resource.data.keys().hasAny([
+          'planId',
+          'plan',
+          'planStatus',
+          'trialEndsAt',
+          'storageLimitMb',
+          'membersLimit',
+          'storageUsedMb',
+          'planBillingCycle',
+          'planRenewsAt'
+        ]);
+
+      allow update: if isEmailVerified() && (
         isSuperAdmin() ||
         (
           resource.data.ownerId == request.auth.uid &&
@@ -92,114 +168,213 @@ service cloud.firestore {
           ])
         )
       );
-      allow delete: if isSuperAdmin();
+
+      allow delete: if isEmailVerified() && isSuperAdmin();
     }
+
+    // =========================================================================
+    // 3. ABONNEMENTS & SUBSCRIPTIONS (SUPER ADMIN & SERVEUR)
+    // =========================================================================
+    match /abonnements/{subId} {
+      allow read, write: if isEmailVerified() && isSuperAdmin();
+    }
+
+    match /subscriptions/{subId} {
+      allow read, write: if isEmailVerified() && isSuperAdmin();
+    }
+
+    // =========================================================================
+    // 4. DONNÉES MÉTIER PRIVÉES DU WORKSPACE (SANS AUCUN ACCÈS SUPER ADMIN)
+    // =========================================================================
+    // Le Super Admin n'a AUCUN accès aux clients, projets, devis et factures.
+    // L'isolation multi-tenant est absolue entre chaque graphiste / studio.
 
     // Répertoire Clients
     match /clients/{clientId} {
-      allow read, update, delete: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin());
-      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
+      allow read: if isAuthenticated() && resource.data.ownerId == request.auth.uid;
+      allow create: if isOwnerAndVerified(request.resource.data.ownerId);
+      allow update: if isEmailVerified() && 
+                       resource.data.ownerId == request.auth.uid &&
+                       !request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerId']);
+      allow delete: if isEmailVerified() && resource.data.ownerId == request.auth.uid;
     }
 
     // Projets créatifs & livrables
-    // Note sécurité : Le portail client par jeton passe par la route serveur dédiée (/api/portal/*).
-    // Le navigateur client n'accède JAMAIS directement à cette collection sans compte propriétaire.
+    // - clientShareToken et clientLinkActive sont réservés exclusivement au serveur
+    // - clientId et projectId doivent appartenir au même propriétaire
+    // - ownerId inaltérable à la mise à jour
     match /projects/{projectId} {
-      allow read, update, delete: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin());
-      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
+      allow read: if isAuthenticated() && resource.data.ownerId == request.auth.uid;
+
+      allow create: if isOwnerAndVerified(request.resource.data.ownerId) &&
+        !request.resource.data.keys().hasAny(['clientShareToken', 'clientLinkActive']) &&
+        clientBelongsToOwner(request.resource.data.clientId, request.auth.uid);
+
+      allow update: if isEmailVerified() &&
+        resource.data.ownerId == request.auth.uid &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'clientShareToken',
+          'clientLinkActive',
+          'ownerId'
+        ]) &&
+        clientBelongsToOwner(request.resource.data.clientId, request.auth.uid);
+
+      allow delete: if isEmailVerified() && resource.data.ownerId == request.auth.uid;
 
       match /mockups/{mockupId} {
-        allow read, write: if isAuthenticated() && (
-          get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid || 
-          isSuperAdmin()
-        );
+        allow read: if isAuthenticated() && 
+          get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid;
+        allow write: if isEmailVerified() && 
+          get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid;
       }
 
       match /deliverables/{deliverableId} {
-        allow read, write: if isAuthenticated() && (
-          get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid || 
-          isSuperAdmin()
-        );
+        allow read: if isAuthenticated() && 
+          get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid;
+        allow write: if isEmailVerified() && 
+          get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid;
       }
     }
 
-    // Devis : dès acceptation (status == 'accepted'), interdiction absolue de modification et de suppression
+    // Devis :
+    // - clientId et projectId doivent appartenir au même propriétaire (request.auth.uid)
+    // - ownerId inaltérable à la mise à jour
+    // - Dès acceptation (status == 'accepted'), verrouillage absolu
     match /quotes/{quoteId} {
-      allow read: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin());
-      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
-      allow update: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin()) && resource.data.status != 'accepted';
-      allow delete: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin()) && resource.data.status != 'accepted';
+      allow read: if isAuthenticated() && resource.data.ownerId == request.auth.uid;
+      
+      allow create: if isOwnerAndVerified(request.resource.data.ownerId) &&
+        projectBelongsToOwner(request.resource.data.projectId, request.auth.uid) &&
+        clientBelongsToOwner(request.resource.data.clientId, request.auth.uid);
+
+      allow update: if isEmailVerified() && 
+        resource.data.ownerId == request.auth.uid && 
+        resource.data.status != 'accepted' &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerId']) &&
+        projectBelongsToOwner(request.resource.data.projectId, request.auth.uid) &&
+        clientBelongsToOwner(request.resource.data.clientId, request.auth.uid);
+
+      allow delete: if isEmailVerified() && 
+        resource.data.ownerId == request.auth.uid && 
+        resource.data.status != 'accepted';
     }
 
-    // Factures : verrouillage strict dès émission (statut autre que 'draft'). Seules les factures brouillon sont éditables/supprimables
+    // Factures :
+    // - clientId et projectId doivent appartenir au même propriétaire (request.auth.uid)
+    // - ownerId inaltérable à la mise à jour
+    // - Verrouillage strict dès émission (statut autre que 'draft'). Seul le brouillon est éditable/supprimable
     match /invoices/{invoiceId} {
-      allow read: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin());
-      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
-      allow update: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin()) && resource.data.status == 'draft';
-      allow delete: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin()) && resource.data.status == 'draft';
+      allow read: if isAuthenticated() && resource.data.ownerId == request.auth.uid;
+      
+      allow create: if isOwnerAndVerified(request.resource.data.ownerId) &&
+        projectBelongsToOwner(request.resource.data.projectId, request.auth.uid) &&
+        clientBelongsToOwner(request.resource.data.clientId, request.auth.uid);
+
+      allow update: if isEmailVerified() && 
+        resource.data.ownerId == request.auth.uid && 
+        resource.data.status == 'draft' &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerId']) &&
+        projectBelongsToOwner(request.resource.data.projectId, request.auth.uid) &&
+        clientBelongsToOwner(request.resource.data.clientId, request.auth.uid);
+
+      allow delete: if isEmailVerified() && 
+        resource.data.ownerId == request.auth.uid && 
+        resource.data.status == 'draft';
     }
 
-    // Paiements & transactions
+    // Paiements & transactions :
+    // - Création seulement ! Aucun update ni delete (registre comptable inaltérable)
+    // - clientId et projectId doivent appartenir au même propriétaire
     match /payments/{paymentId} {
-      allow read, write: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin());
-      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
+      allow read: if isAuthenticated() && resource.data.ownerId == request.auth.uid;
+      
+      allow create: if isOwnerAndVerified(request.resource.data.ownerId) &&
+        projectBelongsToOwner(request.resource.data.projectId, request.auth.uid) &&
+        clientBelongsToOwner(request.resource.data.clientId, request.auth.uid);
+
+      allow update, delete: if false;
     }
 
     // Catalogue des prestations, packs & modèles de devis
     match /catalog_services/{serviceId} {
-      allow read, update, delete: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin());
-      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
+      allow read: if isAuthenticated() && resource.data.ownerId == request.auth.uid;
+      allow create: if isOwnerAndVerified(request.resource.data.ownerId);
+      allow update: if isEmailVerified() && 
+                       resource.data.ownerId == request.auth.uid &&
+                       !request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerId']);
+      allow delete: if isEmailVerified() && resource.data.ownerId == request.auth.uid;
     }
 
     match /catalog_packs/{packId} {
-      allow read, update, delete: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin());
-      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
+      allow read: if isAuthenticated() && resource.data.ownerId == request.auth.uid;
+      allow create: if isOwnerAndVerified(request.resource.data.ownerId);
+      allow update: if isEmailVerified() && 
+                       resource.data.ownerId == request.auth.uid &&
+                       !request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerId']);
+      allow delete: if isEmailVerified() && resource.data.ownerId == request.auth.uid;
     }
 
     match /project_templates/{templateId} {
-      allow read, update, delete: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin());
-      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
+      allow read: if isAuthenticated() && resource.data.ownerId == request.auth.uid;
+      allow create: if isOwnerAndVerified(request.resource.data.ownerId);
+      allow update: if isEmailVerified() && 
+                       resource.data.ownerId == request.auth.uid &&
+                       !request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerId']);
+      allow delete: if isEmailVerified() && resource.data.ownerId == request.auth.uid;
     }
 
     match /custom_categories/{catId} {
-      allow read, update, delete: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin());
-      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
+      allow read: if isAuthenticated() && resource.data.ownerId == request.auth.uid;
+      allow create: if isOwnerAndVerified(request.resource.data.ownerId);
+      allow update: if isEmailVerified() && 
+                       resource.data.ownerId == request.auth.uid &&
+                       !request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerId']);
+      allow delete: if isEmailVerified() && resource.data.ownerId == request.auth.uid;
     }
 
     // Rendez-vous, Temps & Dépenses
     match /appointments/{aptId} {
-      allow read, update, delete: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin());
-      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
+      allow read: if isAuthenticated() && resource.data.ownerId == request.auth.uid;
+      allow create: if isOwnerAndVerified(request.resource.data.ownerId);
+      allow update: if isEmailVerified() && 
+                       resource.data.ownerId == request.auth.uid &&
+                       !request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerId']);
+      allow delete: if isEmailVerified() && resource.data.ownerId == request.auth.uid;
     }
 
     match /time_entries/{entryId} {
-      allow read, update, delete: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin());
-      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
+      allow read: if isAuthenticated() && resource.data.ownerId == request.auth.uid;
+      allow create: if isOwnerAndVerified(request.resource.data.ownerId);
+      allow update: if isEmailVerified() && 
+                       resource.data.ownerId == request.auth.uid &&
+                       !request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerId']);
+      allow delete: if isEmailVerified() && resource.data.ownerId == request.auth.uid;
     }
 
     match /expenses/{expenseId} {
-      allow read, update, delete: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin());
-      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
+      allow read: if isAuthenticated() && resource.data.ownerId == request.auth.uid;
+      allow create: if isOwnerAndVerified(request.resource.data.ownerId);
+      allow update: if isEmailVerified() && 
+                       resource.data.ownerId == request.auth.uid &&
+                       !request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerId']);
+      allow delete: if isEmailVerified() && resource.data.ownerId == request.auth.uid;
+    }
+
+    // Demandes publiques de prospects :
+    // Aucune écriture directe via le SDK client ; seule la route serveur dédiée (Admin SDK) écrit dans /leads
+    match /leads/{leadId} {
+      allow read: if isAuthenticated() && resource.data.ownerId == request.auth.uid;
+      allow write: if false;
     }
 
     // =========================================================================
-    // 3. COLLECTIONS STRICTEMENT RÉSERVÉES AU SERVEUR (AUCUN ACCÈS CLIENT)
+    // 5. COLLECTIONS STRICTEMENT RÉSERVÉES AU SERVEUR (AUCUN ACCÈS CLIENT)
     // =========================================================================
-    // Les codes de vérification, journaux d'emails, abonnements et configurations
-    // sont inaccessibles au SDK client (écriture et lecture gérées par Admin SDK).
     match /verification_codes/{codeId} {
       allow read, write: if false;
     }
 
     match /email_logs/{logId} {
-      allow read, write: if false;
-    }
-
-    match /abonnements/{subId} {
-      allow read, write: if false;
-    }
-
-    match /subscriptions/{subId} {
       allow read, write: if false;
     }
 
@@ -215,21 +390,8 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // Demandes publiques de contact (formulaire prospect)
-    match /leads/{leadId} {
-      allow create: if request.resource.data.name is string &&
-                       request.resource.data.name.size() > 0 &&
-                       request.resource.data.name.size() <= 100 &&
-                       request.resource.data.email is string &&
-                       request.resource.data.email.matches('.*@.*') &&
-                       request.resource.data.description is string &&
-                       request.resource.data.description.size() <= 3000 &&
-                       (!('hp_field' in request.resource.data) || request.resource.data.hp_field == '');
-      allow read, update, delete: if isAuthenticated() && (resource.data.ownerId == request.auth.uid || isSuperAdmin());
-    }
-
     // =========================================================================
-    // 4. REFUS PAR DÉFAUT (ZERO TRUST DEFAULT-DENY)
+    // 6. REFUS PAR DÉFAUT (ZERO TRUST DEFAULT-DENY)
     // =========================================================================
     match /{document=**} {
       allow read, write: if false;

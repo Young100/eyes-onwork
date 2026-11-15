@@ -2,23 +2,17 @@ rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
 
-    function isAuthenticated() {
-      return request.auth != null && request.auth.uid != null;
+    // Vérifie l'authentification et l'email vérifié
+    function isVerifiedUser(userId) {
+      return request.auth != null &&
+             request.auth.uid == userId &&
+             request.auth.token.email_verified == true;
     }
 
-    // Le rôle Super Administrateur est vérifié via custom claim
-    function isSuperAdmin() {
-      return isAuthenticated() && (
-        request.auth.token.role == 'superadmin' ||
-        request.auth.token.isSuperAdmin == true ||
-        request.auth.token.admin == true
-      );
-    }
-
-    // Interdiction stricte de tout format exécutable ou dangereux
+    // Interdiction stricte de tout format exécutable, script ou dangereux (insensible à la casse, .svg inclus)
     function isSafeFile() {
-      return !(request.resource.name.matches('.*\\.(exe|sh|php|js|bat|cmd|vbs|py|bin|jar|msi|html|htm|cgi|pl|phtml)')) &&
-             !(request.resource.contentType.matches('application/x-msdownload|application/x-executable|application/javascript|text/html|application/x-sh'));
+      return !(request.resource.name.matches('(?i).*\\.(exe|bat|cmd|sh|php|phtml|php3|php4|php5|py|pyc|js|mjs|cjs|ts|vbs|jar|bin|msi|com|scr|cpl|dll|reg|hta|html|htm|svg)')) &&
+             !(request.resource.contentType.matches('(?i)image/svg\\+xml|application/x-msdownload|application/x-executable|application/javascript|text/html|application/x-sh'));
     }
 
     // Limite de taille stricte (50 Mo maximum)
@@ -26,35 +20,15 @@ service firebase.storage {
       return request.resource.size <= 50 * 1024 * 1024;
     }
 
-    // 1. Fichiers par utilisateur & logos (logos, avatars, signatures)
+    // SÉCURITÉ ZERO-TRUST : Fichiers seulement sous /users/{uid}/**
+    // Accès uniquement si request.auth.uid == uid et email vérifié.
+    // Aucun accès super admin aux fichiers des utilisateurs.
     match /users/{userId}/{allPaths=**} {
-      allow read: if isAuthenticated() && (request.auth.uid == userId || isSuperAdmin());
-      allow write: if isAuthenticated() && (request.auth.uid == userId || isSuperAdmin()) && isSafeFile() && isValidSize();
-      allow delete: if isAuthenticated() && (request.auth.uid == userId || isSuperAdmin());
+      allow read, delete: if isVerifiedUser(userId);
+      allow create, update: if isVerifiedUser(userId) && isSafeFile() && isValidSize();
     }
 
-    // 2. Fichiers de l'espace de travail (branding, logos d'entreprise, exports)
-    match /workspaces/{workspaceId}/{allPaths=**} {
-      allow read: if isAuthenticated();
-      allow write: if isAuthenticated() && isSafeFile() && isValidSize();
-      allow delete: if isAuthenticated();
-    }
-
-    // 3. Projets créatifs (maquettes, déclinaisons, fichiers sources & livrables)
-    match /projects/{projectId}/{allPaths=**} {
-      allow read: if isAuthenticated();
-      allow write: if isAuthenticated() && isSafeFile() && isValidSize();
-      allow delete: if isAuthenticated();
-    }
-
-    // 4. Téléversements généraux authentifiés
-    match /uploads/{userId}/{allPaths=**} {
-      allow read: if isAuthenticated();
-      allow write: if isAuthenticated() && (request.auth.uid == userId || isSuperAdmin()) && isSafeFile() && isValidSize();
-      allow delete: if isAuthenticated() && (request.auth.uid == userId || isSuperAdmin());
-    }
-
-    // REFUS STRICT PAR DÉFAUT
+    // REFUS STRICT PAR DÉFAUT (fermeture de /workspaces, /projects, /uploads, etc.)
     match /{allPaths=**} {
       allow read, write: if false;
     }

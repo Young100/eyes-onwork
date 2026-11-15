@@ -1,5 +1,10 @@
-import React, { createContext, useContext, useEffect, useState, useMemo } from 'react';
+import React, { createContext, useContext, useEffect, useState, useMemo, useRef } from 'react';
 import { CURRENT_TERMS_VERSION, CURRENT_PRIVACY_VERSION } from '../config/termsConfig';
+import {
+  FirestoreUserGateProfile,
+  FIRESTORE_USER_ALLOWED_UPDATE_KEYS,
+  extractFirestoreGateProfile
+} from '../utils/routeGuard';
 import { db, auth as firebaseAuth } from '../config/firebase';
 import { 
   signOut,
@@ -7,14 +12,24 @@ import {
   createUserWithEmailAndPassword,
   signInWithCustomToken,
   onAuthStateChanged,
-  updateProfile as updateFirebaseProfile
+  updateProfile as updateFirebaseProfile,
+  EmailAuthProvider,
+  GoogleAuthProvider,
+  reauthenticateWithCredential,
+  reauthenticateWithPopup,
+  updatePassword,
+  verifyBeforeUpdateEmail,
+  linkWithPopup
 } from 'firebase/auth';
 import { 
   collection as firestoreCol, 
   doc as firestoreDoc, 
   setDoc as firestoreSetDoc, 
   deleteDoc as firestoreDeleteDoc, 
+  getDoc as firestoreGetDoc,
+  getDocFromServer as firestoreGetDocFromServer,
   getDocs as firestoreGetDocs, 
+  onSnapshot as firestoreOnSnapshot,
   query as firestoreQuery, 
   where as firestoreWhere 
 } from 'firebase/firestore';
@@ -102,8 +117,8 @@ import {
 interface AppContextType {
   auth: UserAuth;
   loginAsDemo: () => void;
-  loginWithEmail: (email: string, pass: string) => Promise<boolean>;
-  logout: () => void;
+  loginWithEmail: (email: string, pass: string) => Promise<{ success: boolean; errorCode?: string }>;
+  logout: () => Promise<void> | void;
   theme: 'dark' | 'light';
   toggleTheme: () => void;
 
@@ -124,6 +139,7 @@ interface AppContextType {
   addPromoCode: (promo: Omit<PromoCode, 'id' | 'usedCount'>) => void;
   togglePromoCode: (id: string) => void;
   exportFullWorkspaceData: () => void;
+  performExportFullWorkspaceData: () => void;
   workspace?: Workspace;
   upgradeModalOpen?: boolean;
   upgradeReason?: string;
@@ -131,14 +147,23 @@ interface AppContextType {
   markNotificationAsRead?: (id: string) => void;
 
   // Auth additions
-  registerWithEmail: (email: string, password: string, name: string, termsVersion?: string) => Promise<{ success: boolean; error?: string; requireVerification?: boolean }>;
-  loginWithGoogle: (email?: string, name?: string) => Promise<{ success: boolean; error?: string; requireTermsAcceptance?: boolean }>;
+  registerWithEmail: (email: string, password: string, name: string, termsVersion?: string) => Promise<{ success: boolean; error?: string; errorCode?: string; requireVerification?: boolean }>;
+  loginWithGoogle: (email?: string, name?: string) => Promise<{ success: boolean; error?: string; requireEmailVerification?: boolean; requireTermsAcceptance?: boolean; requireOnboarding?: boolean; onboardingStep?: number }>;
   sendVerificationCode: (emailToUse?: string) => Promise<{ success: boolean; error?: string; message?: string; cooldownSeconds?: number; expiresAt?: number }>;
   verifyEmailCode: (code: string) => Promise<{ success: boolean; error?: string; message?: string; remainingAttempts?: number }>;
   acceptCurrentTerms: (version?: string) => Promise<{ success: boolean; error?: string }>;
   linkGoogleAccount: (email?: string) => Promise<boolean>;
+  linkGoogleFromSettings: () => Promise<{ success: boolean; error?: string }>;
   reauthenticate: (password: string) => Promise<boolean>;
+  reauthenticateWithGoogle: () => Promise<boolean>;
+  changeAccountPassword: (newPassword: string, options?: { currentPassword?: string; useGoogleReauth?: boolean }) => Promise<{ success: boolean; error?: string }>;
+  changeAccountEmail: (newEmail: string, options?: { currentPassword?: string; useGoogleReauth?: boolean }) => Promise<{ success: boolean; error?: string }>;
+  deleteOwnAccount: (options?: { currentPassword?: string; useGoogleReauth?: boolean }) => Promise<{ success: boolean; error?: string }>;
+  revokeAllDevices: () => Promise<{ success: boolean; error?: string }>;
+  isAuthReady: boolean;
+  isProfileLoaded: boolean;
   isAuthLoading: boolean;
+  firestoreUserDoc: FirestoreUserGateProfile | null;
   authError: string | null;
   clearAuthError: () => void;
   
@@ -166,8 +191,8 @@ interface AppContextType {
   updateProjectStep: (id: string, newStep: ProjectStepKey) => void;
   getProjectById: (id: string) => Project | undefined;
   getProjectByShareToken: (token: string) => Project | undefined;
-  regenerateShareToken: (projectId: string) => string;
-  toggleShareLinkActive: (projectId: string) => void;
+  regenerateShareToken: (projectId: string) => Promise<string>;
+  toggleShareLinkActive: (projectId: string) => Promise<void>;
   archiveProject: (projectId: string) => void;
   
   // Task actions
@@ -328,6 +353,41 @@ const STORAGE_KEYS = {
   CUSTOM_CATEGORIES: 'eyesonwork_custom_categories'
 };
 
+const INITIAL_UNAUTHENTICATED_AUTH: UserAuth = {
+  uid: '',
+  email: '',
+  displayName: '',
+  isAuthenticated: false,
+  emailVerified: false,
+  provider: 'password',
+  linkedProviders: [],
+  workspaceId: '',
+  role: 'owner',
+  isSuperAdmin: false,
+  termsAcceptedVersion: undefined,
+  termsAcceptedAt: undefined,
+  onboardingCompleted: false,
+  onboardingStep: 1
+};
+
+const EMPTY_DESIGNER_PROFILE: DesignerProfile = {
+  ...INITIAL_DESIGNER_PROFILE,
+  id: '',
+  name: '',
+  studioName: '',
+  email: '',
+  emailVerified: false,
+  emailVerifiedAt: undefined,
+  termsAcceptedVersion: undefined,
+  termsAcceptedAt: undefined,
+  privacyAcceptedVersion: undefined,
+  privacyAcceptedAt: undefined,
+  onboardingCompleted: false,
+  onboardingCompletedAt: undefined,
+  onboardingStep: 1,
+  workspaceId: ''
+};
+
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -359,26 +419,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setTheme(prev => prev === 'dark' ? 'light' : 'dark');
   };
 
-  // Workspaces state
-  const [allWorkspaces, setAllWorkspaces] = useState<Workspace[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.WORKSPACES);
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) {
-          return parsed.map((w: Workspace) => ({
-            ...w,
-            ownerEmail: w.ownerEmail || (w.id === 'ws_default' ? 'contact@atelierparis.fr' : '')
-          }));
-        }
-      } catch {}
-    }
-    return INITIAL_DEMO_WORKSPACES;
-  });
+  // Workspaces state (jamais pré-rempli de démo hors mode démo explicite)
+  const [allWorkspaces, setAllWorkspaces] = useState<Workspace[]>([]);
 
   const saveWorkspaces = (next: Workspace[]) => {
     setAllWorkspaces(next);
-    localStorage.setItem(STORAGE_KEYS.WORKSPACES, JSON.stringify(next));
   };
 
   // Plans config
@@ -408,60 +453,75 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return DEFAULT_PLATFORM_EMAIL_TEMPLATES;
   });
 
-  // Auth state
-  const [auth, setAuth] = useState<UserAuth>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.AUTH);
-    if (saved) {
-      try { 
-        const parsed = JSON.parse(saved);
-        if (parsed && parsed.uid && parsed.isAuthenticated) {
-          const isSuper = isSuperAdminUser(parsed.email);
-          return {
-            ...parsed,
-            workspaceId: parsed.workspaceId || (isSuper ? 'ws_abdoulaye' : 'ws_default'),
-            role: parsed.role || (isSuper ? 'superadmin' : 'owner'),
-            isSuperAdmin: parsed.isSuperAdmin !== undefined ? parsed.isSuperAdmin : isSuper
-          };
-        }
-      } catch {}
-    }
-    return {
-      uid: '',
-      email: '',
-      displayName: '',
-      isAuthenticated: false,
-      emailVerified: false,
-      provider: 'password',
-      linkedProviders: ['password'],
-      workspaceId: '',
-      role: 'owner',
-      isSuperAdmin: false,
-      termsAcceptedVersion: undefined,
-      termsAcceptedAt: undefined,
-      onboardingCompleted: false,
-      onboardingStep: 1
-    };
-  });
+  // Suivi centralisé des écouteurs Firestore et de la session active
+  const activeListenersRef = useRef<Array<() => void>>([]);
+  const activeUserListenerUidRef = useRef<string | null>(null);
+  const authSessionSeqRef = useRef<number>(0);
+  const isRegisteringRef = useRef<boolean>(false);
+  const isDemoRef = useRef<boolean>(false);
 
-  const [isAuthLoading, setIsAuthLoading] = useState<boolean>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.AUTH);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        return Boolean(parsed.isAuthenticated && parsed.email);
+  const stopAllListeners = () => {
+    while (activeListenersRef.current.length > 0) {
+      const unsub = activeListenersRef.current.pop();
+      if (typeof unsub === 'function') {
+        try {
+          unsub();
+        } catch (err) {
+          console.warn('[FirestoreListeners] Unsubscribe notice:', err);
+        }
       }
-    } catch {}
-    return false;
-  });
+    }
+    activeUserListenerUidRef.current = null;
+  };
+
+  // Auth & Firestore profile gate state (JAMAIS initialisé depuis localStorage)
+  const [auth, setAuth] = useState<UserAuth>(INITIAL_UNAUTHENTICATED_AUTH);
+  const [firestoreUserDoc, setFirestoreUserDoc] = useState<FirestoreUserGateProfile | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState<boolean>(false);
+  const [isProfileLoaded, setIsProfileLoaded] = useState<boolean>(false);
+  const [isAuthLoading, setIsAuthLoading] = useState<boolean>(true);
+  const [currentFbUser, setCurrentFbUser] = useState<any>(() => firebaseAuth.currentUser);
   const [authError, setAuthError] = useState<string | null>(null);
   const clearAuthError = () => setAuthError(null);
 
   const saveAuth = (newAuth: UserAuth) => {
     setAuth(newAuth);
-    localStorage.setItem(STORAGE_KEYS.AUTH, JSON.stringify(newAuth));
   };
 
   const loginAsDemo = () => {
+    stopAllListeners();
+    isDemoRef.current = true;
+    setAllWorkspaces(INITIAL_DEMO_WORKSPACES);
+    setClients(INITIAL_CLIENTS);
+    setProjects(INITIAL_PROJECTS.map(normalizeProject));
+    setQuotes(INITIAL_QUOTES);
+    setInvoices(INITIAL_INVOICES);
+    setNotifications(INITIAL_NOTIFICATIONS);
+    setAppointments(INITIAL_APPOINTMENTS);
+    setTimeEntries(INITIAL_TIME_ENTRIES);
+    setExpenses(INITIAL_EXPENSES);
+    setReminderQueue(INITIAL_REMINDERS);
+    setLeads(INITIAL_LEADS);
+    setEmailLogs(INITIAL_EMAIL_LOGS);
+    setPaymentTransactions(INITIAL_PAYMENT_TRANSACTIONS);
+    setAuditLogs(INITIAL_AUDIT_LOGS);
+    setCatalogServices(INITIAL_CATALOG_SERVICES);
+    setCatalogPacks(INITIAL_CATALOG_PACKS);
+    setProjectTemplates(INITIAL_TEMPLATES);
+
+    const demoNow = new Date().toISOString();
+    setFirestoreUserDoc({
+      uid: 'designer_001',
+      email: 'contact@monstudio.fr',
+      emailVerified: true,
+      termsAcceptedVersion: CURRENT_TERMS_VERSION,
+      termsAcceptedAt: demoNow,
+      onboardingCompleted: true,
+      onboardingCompletedAt: demoNow,
+      onboardingStep: 5,
+      workspaceId: 'ws_default',
+      role: 'owner'
+    });
     saveAuth({
       uid: 'designer_001',
       email: 'contact@monstudio.fr',
@@ -475,177 +535,133 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       role: 'owner',
       isSuperAdmin: false,
       termsAcceptedVersion: CURRENT_TERMS_VERSION,
-      termsAcceptedAt: new Date().toISOString(),
+      termsAcceptedAt: demoNow,
       onboardingCompleted: true,
       onboardingStep: 5
     });
-  };
-
-  const loginWithEmail = async (email: string, pass: string): Promise<boolean> => {
-    const cleanEmail = email.trim().toLowerCase();
-    if (cleanEmail.length > 3 && pass.length >= 4) {
-      setIsAuthLoading(true);
-      try {
-        let firebaseUser: any = null;
-        try {
-          const cred = await signInWithEmailAndPassword(firebaseAuth, cleanEmail, pass);
-          firebaseUser = cred.user;
-        } catch (authErr: any) {
-          setIsAuthLoading(false);
-          return false;
-        }
-
-        if (!firebaseUser) {
-          setIsAuthLoading(false);
-          return false;
-        }
-
-        let idToken = '';
-        try {
-          idToken = await firebaseUser.getIdToken();
-        } catch {}
-
-        let serverUser: any = null;
-        if (idToken) {
-          try {
-            const profileRes = await fetch('/api/user/profile', {
-              headers: { 'Authorization': `Bearer ${idToken}` }
-            });
-            const text = await profileRes.text();
-            const pData = text ? JSON.parse(text) : null;
-            if (profileRes.ok && pData?.profile) {
-              serverUser = pData.profile;
-            }
-          } catch {}
-        }
-
-        const isSuper = isSuperAdminUser(cleanEmail) || serverUser?.role === 'superadmin';
-        const existingWs = allWorkspaces.find(w => 
-          (w.ownerEmail && w.ownerEmail.toLowerCase() === cleanEmail) || 
-          (Array.isArray(w.members) && w.members.some(m => m.email && m.email.toLowerCase() === cleanEmail))
-        );
-        const wsId = serverUser?.workspaceId || (existingWs ? existingWs.id : `ws_${cleanEmail.replace(/[^a-z0-9]/gi, '_')}`);
-        const isVerified = isSuper || Boolean(firebaseUser.emailVerified || serverUser?.emailVerified);
-
-        // Ensure workspace is registered in allWorkspaces
-        if (!allWorkspaces.some(w => w.id === wsId)) {
-          const userWs: Workspace = {
-            id: wsId,
-            name: serverUser?.studioName || `Studio ${serverUser?.displayName || cleanEmail.split('@')[0]}`,
-            ownerId: firebaseUser.uid,
-            ownerEmail: cleanEmail,
-            planId: 'free',
-            planStatus: 'trial',
-            planBillingCycle: 'monthly',
-            planStartedAt: new Date().toISOString(),
-            planRenewsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
-            trialEndsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
-            storageUsedMb: 0,
-            members: [{
-              userId: firebaseUser.uid,
-              email: cleanEmail,
-              name: serverUser?.displayName || cleanEmail.split('@')[0],
-              role: 'owner',
-              joinedAt: new Date().toISOString()
-            }],
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString()
-          };
-          saveWorkspaces([userWs, ...allWorkspaces]);
-        }
-
-        const newAuth: UserAuth = {
-          uid: firebaseUser.uid,
-          email: cleanEmail,
-          displayName: serverUser?.displayName || cleanEmail.split('@')[0] || 'Graphiste',
-          isAuthenticated: true,
-          emailVerified: isVerified,
-          emailVerifiedAt: serverUser?.emailVerifiedAt || (isVerified ? new Date().toISOString() : null),
-          provider: 'password',
-          linkedProviders: ['password'],
-          workspaceId: wsId,
-          role: serverUser?.role || (isSuper ? 'superadmin' : 'owner'),
-          isSuperAdmin: isSuper,
-          termsAcceptedVersion: serverUser?.termsAcceptedVersion || null,
-          termsAcceptedAt: serverUser?.termsAcceptedAt || null,
-          privacyAcceptedVersion: serverUser?.privacyAcceptedVersion || null,
-          privacyAcceptedAt: serverUser?.privacyAcceptedAt || null,
-          onboardingCompleted: serverUser?.onboardingCompleted ?? false,
-          onboardingCompletedAt: serverUser?.onboardingCompletedAt || null,
-          onboardingStep: serverUser?.onboardingStep ?? 1,
-          createdAt: serverUser?.createdAt || new Date().toISOString()
-        };
-
-        saveAuth(newAuth);
-
-        setProfile(prev => ({
-          ...prev,
-          name: serverUser?.displayName || prev.name,
-          studioName: serverUser?.studioName || prev.studioName,
-          email: cleanEmail,
-          emailVerified: isVerified,
-          emailVerifiedAt: serverUser?.emailVerifiedAt || (isVerified ? new Date().toISOString() : null),
-          termsAcceptedVersion: serverUser?.termsAcceptedVersion || null,
-          termsAcceptedAt: serverUser?.termsAcceptedAt || null,
-          privacyAcceptedVersion: serverUser?.privacyAcceptedVersion || null,
-          privacyAcceptedAt: serverUser?.privacyAcceptedAt || null,
-          onboardingCompleted: serverUser?.onboardingCompleted ?? false,
-          onboardingCompletedAt: serverUser?.onboardingCompletedAt || null,
-          onboardingStep: serverUser?.onboardingStep ?? 1,
-          workspaceId: wsId
-        }));
-
-        setIsAuthLoading(false);
-        return true;
-      } catch (err) {
-        console.error('[loginWithEmail] login failed:', err);
-        setIsAuthLoading(false);
-        return false;
-      }
-    }
-    return false;
-  };
-
-  const logout = () => {
-    // 0. Sign out from Firebase Auth
-    try {
-      signOut(firebaseAuth).catch(() => {});
-    } catch {}
-
-    // 1. Reset auth state
-    saveAuth({
-      uid: '',
-      email: '',
-      displayName: '',
-      isAuthenticated: false,
-      workspaceId: '',
-      role: 'owner',
-      isSuperAdmin: false
+    setProfile({
+      ...INITIAL_DESIGNER_PROFILE,
+      id: 'designer_001',
+      email: 'contact@monstudio.fr',
+      emailVerified: true,
+      termsAcceptedVersion: CURRENT_TERMS_VERSION,
+      termsAcceptedAt: demoNow,
+      onboardingCompleted: true,
+      onboardingCompletedAt: demoNow,
+      onboardingStep: 5,
+      workspaceId: 'ws_default'
     });
+    setIsAuthReady(true);
+    setIsProfileLoaded(true);
+    setIsAuthLoading(false);
+  };
 
-    // 2. Full deep cleanup: session, local caches, tokens
+  const loginWithEmail = async (email: string, pass: string): Promise<{ success: boolean; errorCode?: string }> => {
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail || !pass) {
+      return { success: false, errorCode: 'auth/invalid-credential' };
+    }
+
+    setIsAuthLoading(true);
     try {
-      localStorage.removeItem(STORAGE_KEYS.AUTH);
-      localStorage.removeItem(STORAGE_KEYS.PROFILE);
+      let firebaseUser: any = null;
+      try {
+        const cred = await signInWithEmailAndPassword(firebaseAuth, cleanEmail, pass);
+        firebaseUser = cred.user;
+      } catch (authErr: any) {
+        setIsAuthLoading(false);
+        return { success: false, errorCode: authErr?.code || 'auth/invalid-credential' };
+      }
+
+      if (!firebaseUser) {
+        setIsAuthLoading(false);
+        return { success: false, errorCode: 'auth/invalid-credential' };
+      }
+
+      const cleanEmailFromUser = (firebaseUser.email || cleanEmail).trim().toLowerCase();
+      await loadFirestoreUserProfile(firebaseUser, {
+        fallbackEmail: cleanEmailFromUser,
+        providerHint: 'password'
+      });
+
+      return { success: true };
+    } catch (err: any) {
+      console.error('[loginWithEmail] login failed:', err);
+      setIsAuthLoading(false);
+      return { success: false, errorCode: err?.code || 'auth/invalid-credential' };
+    }
+  };
+
+  const logout = async () => {
+    // 0. Invalider toute requête asynchrone en cours et quitter le mode démo
+    authSessionSeqRef.current += 1;
+    isDemoRef.current = false;
+    isRegisteringRef.current = false;
+
+    // 1. Arrêter tous les écouteurs Firestore actifs (users/{uid}, collections, etc.)
+    stopAllListeners();
+
+    // 2. Déconnecter Firebase Authentication
+    try {
+      await signOut(firebaseAuth);
+    } catch (err) {
+      console.warn('[logout] signOut notice:', err);
+    }
+
+    // 3. Vider intégralement l'état en mémoire (authentification, profil, workspace, collections métier, portail/modales)
+    setCurrentFbUser(null);
+    setFirestoreUserDoc(null);
+    setIsProfileLoaded(false);
+    setIsAuthReady(true);
+    setIsAuthLoading(false);
+    setAuthError(null);
+    setAuth(INITIAL_UNAUTHENTICATED_AUTH);
+    setProfile(EMPTY_DESIGNER_PROFILE);
+    setAllWorkspaces([]);
+    setClients([]);
+    setProjects([]);
+    setQuotes([]);
+    setInvoices([]);
+    setNotifications([]);
+    setAppointments([]);
+    setTimeEntries([]);
+    setExpenses([]);
+    setLeads([]);
+    setReminderQueue([]);
+    setEmailLogs([]);
+    setPaymentTransactions([]);
+    setAuditLogs([]);
+    setCatalogServices([]);
+    setCatalogPacks([]);
+    setProjectTemplates([]);
+    setCustomCategories([]);
+    setActiveClientPortalToken(null);
+    setIsClientPortalPreview(false);
+    setIsUpgradeModalOpen(false);
+
+    // 4. Nettoyer le stockage de session et les clés d'interface
+    try {
       sessionStorage.clear();
-      // Remove any user-scoped or session keys
+      Object.values(STORAGE_KEYS).forEach(key => {
+        if (key !== STORAGE_KEYS.THEME) {
+          localStorage.removeItem(key);
+        }
+      });
       const keysToRemove: string[] = [];
       for (let i = 0; i < localStorage.length; i++) {
         const k = localStorage.key(i);
-        if (k && (k.startsWith('eyesonwork_auth_') || k.startsWith('eyesonwork_session_') || k.startsWith('eyesonwork_token_'))) {
+        if (
+          k &&
+          (k.startsWith('eyesonwork_auth') ||
+            k.startsWith('eyesonwork_profile') ||
+            k.startsWith('eyesonwork_session_') ||
+            k.startsWith('eyesonwork_token_'))
+        ) {
           keysToRemove.push(k);
         }
       }
       keysToRemove.forEach(k => localStorage.removeItem(k));
     } catch {}
-
-    // 3. Reset in-memory profile
-    setProfile(INITIAL_DESIGNER_PROFILE);
-
-    // 4. Reset client portal state
-    setActiveClientPortalToken(null);
-    setIsClientPortalPreview(false);
-    setIsUpgradeModalOpen(false);
   };
 
   // Active Workspace
@@ -745,7 +761,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   // Auth additions
-  const registerWithEmail = async (email: string, password: string, name: string, termsVersion: string = '2026.1'): Promise<{ success: boolean; error?: string; requireVerification?: boolean }> => {
+  const registerWithEmail = async (
+    email: string,
+    password: string,
+    name: string,
+    termsVersion: string = '2026.1'
+  ): Promise<{ success: boolean; error?: string; errorCode?: string; requireVerification?: boolean }> => {
     const cleanEmail = email.trim().toLowerCase();
     if (!cleanEmail || !cleanEmail.includes('@')) {
       return { success: false, error: 'Veuillez saisir une adresse email valide.' };
@@ -755,6 +776,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
     const isSuper = isSuperAdminUser(cleanEmail);
 
+    isRegisteringRef.current = true;
     setIsAuthLoading(true);
     try {
       let firebaseUser: any = null;
@@ -765,14 +787,64 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           await updateFirebaseProfile(firebaseUser, { displayName: name });
         }
       } catch (authErr: any) {
-        setIsAuthLoading(false);
         if (authErr?.code === 'auth/email-already-in-use') {
-          return { success: false, error: 'Un compte existe déjà avec cette adresse email.' };
+          // Si un compte email jamais vérifié date de plus de 24h, le purger côté serveur puis réessayer
+          let staleCleaned = false;
+          try {
+            const cleanupRes = await fetch('/api/auth/cleanup-stale-unverified', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ email: cleanEmail })
+            });
+            const cleanupData = await cleanupRes.json();
+            staleCleaned = Boolean(cleanupData?.cleaned);
+          } catch {}
+
+          if (staleCleaned) {
+            try {
+              const retryCred = await createUserWithEmailAndPassword(firebaseAuth, cleanEmail, password);
+              firebaseUser = retryCred.user;
+              if (name && firebaseUser) {
+                await updateFirebaseProfile(firebaseUser, { displayName: name });
+              }
+            } catch (retryErr: any) {
+              isRegisteringRef.current = false;
+              setIsAuthLoading(false);
+              if (retryErr?.code === 'auth/email-already-in-use') {
+                return {
+                  success: false,
+                  errorCode: 'auth/email-already-in-use',
+                  error: 'Cette adresse est déjà utilisée'
+                };
+              }
+              return {
+                success: false,
+                errorCode: retryErr?.code,
+                error: retryErr?.message || 'Erreur lors de la création du compte.'
+              };
+            }
+          } else {
+            isRegisteringRef.current = false;
+            setIsAuthLoading(false);
+            return {
+              success: false,
+              errorCode: 'auth/email-already-in-use',
+              error: 'Cette adresse est déjà utilisée'
+            };
+          }
+        } else {
+          isRegisteringRef.current = false;
+          setIsAuthLoading(false);
+          return {
+            success: false,
+            errorCode: authErr?.code,
+            error: authErr?.message || 'Erreur lors de la création du compte.'
+          };
         }
-        return { success: false, error: authErr?.message || 'Erreur lors de la création du compte.' };
       }
 
       if (!firebaseUser) {
+        isRegisteringRef.current = false;
         setIsAuthLoading(false);
         return { success: false, error: 'Erreur lors de la création du compte.' };
       }
@@ -782,36 +854,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         idToken = await firebaseUser.getIdToken();
       } catch {}
 
-      const newWsId = `ws_${firebaseUser.uid.slice(0, 8)}`;
-      const newWs: Workspace = {
-        id: newWsId,
-        name: `Studio ${name || cleanEmail.split('@')[0]}`,
-        ownerId: firebaseUser.uid,
-        ownerEmail: cleanEmail,
-        planId: 'free',
-        planStatus: 'trial',
-        planBillingCycle: 'monthly',
-        planStartedAt: new Date().toISOString(),
-        planRenewsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
-        trialEndsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
-        storageUsedMb: 0,
-        members: [
-          {
-            userId: firebaseUser.uid,
-            email: cleanEmail,
-            name: name || cleanEmail.split('@')[0],
-            role: 'owner',
-            joinedAt: new Date().toISOString()
-          }
-        ],
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      };
-
-      saveWorkspaces([newWs, ...allWorkspaces]);
-
-      // Enregistrement sécurisé du profil et des conditions sur le serveur via Bearer Token
+      // Création unique et idempotente du profil & workspace aléatoire côté serveur par uid
       if (idToken) {
+        try {
+          await fetch('/api/user/profile', {
+            headers: { 'Authorization': `Bearer ${idToken}` }
+          });
+        } catch {}
+
+        // Mise à jour du displayName via la liste blanche autorisée
         try {
           await fetch('/api/user/profile', {
             method: 'POST',
@@ -820,183 +871,94 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               'Authorization': `Bearer ${idToken}`
             },
             body: JSON.stringify({
-              displayName: name || cleanEmail.split('@')[0],
-              studioName: `Studio ${name || cleanEmail.split('@')[0]}`,
-              termsAcceptedVersion: termsVersion,
-              termsAcceptedAt: new Date().toISOString(),
-              onboardingCompleted: false
+              displayName: name || cleanEmail.split('@')[0]
             })
           });
         } catch {}
+
+        // Enregistrement serveur de l'acceptation des conditions si cochée lors de l'inscription
+        if (termsVersion) {
+          try {
+            await fetch('/api/auth/accept-terms', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${idToken}`
+              },
+              body: JSON.stringify({})
+            });
+          } catch {}
+        }
       }
 
-      const newAuth: UserAuth = {
-        uid: firebaseUser.uid,
-        email: cleanEmail,
-        displayName: name || cleanEmail.split('@')[0],
-        isAuthenticated: true,
-        emailVerified: false,
-        provider: 'password',
-        linkedProviders: ['password'],
-        workspaceId: newWsId,
-        role: isSuper ? 'superadmin' : 'owner',
-        isSuperAdmin: isSuper,
-        termsAcceptedVersion: termsVersion,
-        termsAcceptedAt: new Date().toISOString(),
-        onboardingCompleted: false,
-        onboardingStep: 1,
-        createdAt: new Date().toISOString()
-      };
-      saveAuth(newAuth);
-
-      const defaultProfile: DesignerProfile = {
-        ...INITIAL_DESIGNER_PROFILE,
-        id: firebaseUser.uid,
-        name: name || cleanEmail.split('@')[0] || 'Graphiste',
-        studioName: name ? `Studio ${name}` : 'Mon Studio Graphique',
-        email: cleanEmail,
-        emailVerified: false,
-        termsAcceptedVersion: termsVersion,
-        onboardingCompleted: false,
-        onboardingStep: 1,
-        workspaceId: newWsId,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      };
-      setProfile(defaultProfile);
-      setIsAuthLoading(false);
+      isRegisteringRef.current = false;
+      const loadedGate = await loadFirestoreUserProfile(firebaseUser, {
+        fallbackEmail: cleanEmail,
+        fallbackDisplayName: name || cleanEmail.split('@')[0],
+        providerHint: 'password'
+      });
 
       // Envoi du code de vérification par email
       try {
         await sendVerificationCode(cleanEmail);
       } catch {}
 
-      return { success: true, requireVerification: true };
+      return {
+        success: true,
+        requireVerification: !Boolean(loadedGate?.emailVerified)
+      };
     } catch (err: any) {
+      isRegisteringRef.current = false;
       console.warn('[registerWithEmail] error:', err);
       setIsAuthLoading(false);
-      return { success: false, error: err?.message || 'Erreur lors de la création du compte.' };
+      return { success: false, errorCode: err?.code, error: err?.message || 'Erreur lors de la création du compte.' };
     }
   };
 
   const loginWithGoogle = async (
     customEmail?: string,
     customName?: string
-  ): Promise<{ success: boolean; error?: string; requireTermsAcceptance?: boolean }> => {
-    if (!customEmail || !customEmail.trim()) {
+  ): Promise<{ 
+    success: boolean; 
+    error?: string; 
+    requireEmailVerification?: boolean;
+    requireTermsAcceptance?: boolean; 
+    requireOnboarding?: boolean; 
+    onboardingStep?: number 
+  }> => {
+    const currentFirebaseUser = firebaseAuth.currentUser;
+    const resolvedEmail = (customEmail || currentFirebaseUser?.email || '').trim().toLowerCase();
+
+    if (!currentFirebaseUser || (!resolvedEmail && !currentFirebaseUser.email)) {
       return { success: false, error: 'Veuillez sélectionner un compte Google.' };
     }
-    const googleEmail = customEmail.trim().toLowerCase();
+
+    const googleEmail = resolvedEmail || (currentFirebaseUser.email || '').trim().toLowerCase();
     const rawPart = googleEmail.split('@')[0].replace(/[._]/g, ' ');
-    const displayName = customName || (rawPart.charAt(0).toUpperCase() + rawPart.slice(1));
-    const isSuper = isSuperAdminUser(googleEmail);
+    const displayName = customName || currentFirebaseUser.displayName || (rawPart.charAt(0).toUpperCase() + rawPart.slice(1));
 
     setIsAuthLoading(true);
     try {
-      let currentFirebaseUser = firebaseAuth.currentUser;
+      const loadedGate = await loadFirestoreUserProfile(currentFirebaseUser, {
+        fallbackEmail: googleEmail,
+        fallbackDisplayName: displayName,
+        providerHint: 'google'
+      });
 
-      // Récupération sécurisée du Bearer ID Token
-      let idToken = '';
-      if (currentFirebaseUser) {
-        try {
-          idToken = await currentFirebaseUser.getIdToken();
-        } catch {}
-      }
-
-      // Synchronisation avec le profil permanent sur Firestore via le serveur
-      let serverUser: any = null;
-      if (idToken) {
-        try {
-          const profileRes = await fetch('/api/user/profile', {
-            headers: { 'Authorization': `Bearer ${idToken}` }
-          });
-          const profileText = await profileRes.text();
-          const profileData = profileText ? JSON.parse(profileText) : null;
-          if (profileRes.ok && profileData?.success && profileData?.profile) {
-            serverUser = profileData.profile;
-          }
-        } catch (profErr) {
-          console.warn('[loginWithGoogle] Profile fetch notice:', profErr);
-        }
-      }
-
-      const uid = currentFirebaseUser?.uid || serverUser?.uid || `user_${googleEmail.replace(/[^a-z0-9]/gi, '_')}`;
-
-      let ws = allWorkspaces.find(w => 
-        (w.ownerEmail && w.ownerEmail.toLowerCase() === googleEmail) ||
-        (Array.isArray(w.members) && w.members.some(m => m.email && m.email.toLowerCase() === googleEmail))
+      const isEmailVerified = Boolean(loadedGate?.emailVerified);
+      const isTermsValid = Boolean(
+        loadedGate?.termsAcceptedVersion && loadedGate.termsAcceptedVersion >= CURRENT_TERMS_VERSION
       );
-      if (!ws) {
-        ws = {
-          id: serverUser?.workspaceId || `ws_${Date.now()}`,
-          name: serverUser?.studioName || `Studio ${displayName}`,
-          ownerId: uid,
-          ownerEmail: googleEmail,
-          planId: 'free',
-          planStatus: 'trial',
-          planBillingCycle: 'monthly',
-          planStartedAt: new Date().toISOString(),
-          planRenewsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
-          trialEndsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
-          storageUsedMb: 0,
-          members: [{
-            userId: uid,
-            email: googleEmail,
-            name: displayName,
-            role: 'owner',
-            joinedAt: new Date().toISOString()
-          }],
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        };
-        saveWorkspaces([ws, ...allWorkspaces]);
-      }
+      const hasCompletedOnboarding = Boolean(loadedGate?.onboardingCompleted);
+      const onboardingStep = typeof loadedGate?.onboardingStep === 'number' ? loadedGate.onboardingStep : 1;
 
-      const newAuth: UserAuth = {
-        uid,
-        email: googleEmail,
-        displayName: serverUser?.displayName || displayName,
-        photoURL: currentFirebaseUser?.photoURL || serverUser?.avatarUrl || '',
-        isAuthenticated: true,
-        emailVerified: true,
-        emailVerifiedAt: serverUser?.emailVerifiedAt || new Date().toISOString(),
-        provider: 'google',
-        linkedProviders: ['google'],
-        workspaceId: ws.id,
-        role: serverUser?.role || (isSuper ? 'superadmin' : 'owner'),
-        isSuperAdmin: isSuper || serverUser?.role === 'superadmin',
-        termsAcceptedVersion: serverUser?.termsAcceptedVersion || null,
-        termsAcceptedAt: serverUser?.termsAcceptedAt || null,
-        privacyAcceptedVersion: serverUser?.privacyAcceptedVersion || null,
-        privacyAcceptedAt: serverUser?.privacyAcceptedAt || null,
-        onboardingCompleted: serverUser?.onboardingCompleted ?? false,
-        onboardingCompletedAt: serverUser?.onboardingCompletedAt || null,
-        onboardingStep: serverUser?.onboardingStep ?? 1,
-        createdAt: serverUser?.createdAt || new Date().toISOString()
+      return { 
+        success: true, 
+        requireEmailVerification: !isEmailVerified,
+        requireTermsAcceptance: !isTermsValid, 
+        requireOnboarding: !hasCompletedOnboarding, 
+        onboardingStep 
       };
-      saveAuth(newAuth);
-
-      setProfile(prev => ({
-        ...prev,
-        id: uid,
-        name: serverUser?.displayName || displayName,
-        studioName: serverUser?.studioName || `Studio ${displayName}`,
-        email: googleEmail,
-        emailVerified: true,
-        emailVerifiedAt: serverUser?.emailVerifiedAt || new Date().toISOString(),
-        termsAcceptedVersion: serverUser?.termsAcceptedVersion || null,
-        termsAcceptedAt: serverUser?.termsAcceptedAt || null,
-        privacyAcceptedVersion: serverUser?.privacyAcceptedVersion || null,
-        privacyAcceptedAt: serverUser?.privacyAcceptedAt || null,
-        onboardingCompleted: serverUser?.onboardingCompleted ?? false,
-        onboardingCompletedAt: serverUser?.onboardingCompletedAt || null,
-        onboardingStep: serverUser?.onboardingStep ?? 1,
-        workspaceId: ws.id
-      }));
-
-      setIsAuthLoading(false);
-      const isTermsValid = Boolean(serverUser?.termsAcceptedVersion && serverUser.termsAcceptedVersion >= CURRENT_TERMS_VERSION);
-      return { success: true, requireTermsAcceptance: !isTermsValid };
     } catch (err: any) {
       console.error('[loginWithGoogle] sync error:', err);
       setIsAuthLoading(false);
@@ -1098,14 +1060,38 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       if (res.ok && data.success) {
         const verifiedAt = data.emailVerifiedAt || data.profile?.emailVerifiedAt || new Date().toISOString();
+        if (firebaseAuth.currentUser) {
+          try {
+            await firebaseAuth.currentUser.reload();
+            await firebaseAuth.currentUser.getIdToken(true);
+          } catch {}
+        }
+        setFirestoreUserDoc(prev =>
+          prev
+            ? {
+                ...prev,
+                emailVerified: true
+              }
+            : {
+                uid: firebaseAuth.currentUser?.uid || auth.uid,
+                email: cleanEmail,
+                emailVerified: true,
+                termsAcceptedVersion: data.profile?.termsAcceptedVersion ?? null,
+                onboardingCompleted: Boolean(data.profile?.onboardingCompleted),
+                onboardingStep: data.profile?.onboardingStep ?? 1,
+                workspaceId: data.profile?.workspaceId || auth.workspaceId
+              }
+        );
         if (auth.isAuthenticated) {
-          const updatedAuth = {
+          saveAuth({
             ...auth,
             emailVerified: true,
             emailVerifiedAt: verifiedAt
-          };
-          saveAuth(updatedAuth);
-          updateProfile({ emailVerified: true, emailVerifiedAt: verifiedAt });
+          });
+          setProfile(prev => ({ ...prev, emailVerified: true, emailVerifiedAt: verifiedAt }));
+        }
+        if (firebaseAuth.currentUser) {
+          await loadFirestoreUserProfile(firebaseAuth.currentUser, { providerHint: auth.provider });
         }
         return { success: true, message: data.message || 'Email vérifié avec succès.' };
       }
@@ -1159,21 +1145,37 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       const updated = data.profile || {};
-      const updatedAuth: UserAuth = {
+      const nextTermsVer = updated.termsAcceptedVersion || version;
+      const nextTermsAt = updated.termsAcceptedAt || new Date().toISOString();
+      const nextPrivacyVer = updated.privacyAcceptedVersion || CURRENT_PRIVACY_VERSION;
+      const nextPrivacyAt = updated.privacyAcceptedAt || new Date().toISOString();
+
+      setFirestoreUserDoc(prev =>
+        prev
+          ? {
+              ...prev,
+              termsAcceptedVersion: nextTermsVer,
+              termsAcceptedAt: nextTermsAt,
+              privacyAcceptedVersion: nextPrivacyVer,
+              privacyAcceptedAt: nextPrivacyAt
+            }
+          : prev
+      );
+
+      saveAuth({
         ...auth,
-        termsAcceptedVersion: updated.termsAcceptedVersion || version,
-        termsAcceptedAt: updated.termsAcceptedAt || new Date().toISOString(),
-        privacyAcceptedVersion: updated.privacyAcceptedVersion || CURRENT_PRIVACY_VERSION,
-        privacyAcceptedAt: updated.privacyAcceptedAt || new Date().toISOString()
-      };
-      saveAuth(updatedAuth);
+        termsAcceptedVersion: nextTermsVer,
+        termsAcceptedAt: nextTermsAt,
+        privacyAcceptedVersion: nextPrivacyVer,
+        privacyAcceptedAt: nextPrivacyAt
+      });
 
       setProfile(prev => ({
         ...prev,
-        termsAcceptedVersion: updated.termsAcceptedVersion || version,
-        termsAcceptedAt: updated.termsAcceptedAt || new Date().toISOString(),
-        privacyAcceptedVersion: updated.privacyAcceptedVersion || CURRENT_PRIVACY_VERSION,
-        privacyAcceptedAt: updated.privacyAcceptedAt || new Date().toISOString()
+        termsAcceptedVersion: nextTermsVer,
+        termsAcceptedAt: nextTermsAt,
+        privacyAcceptedVersion: nextPrivacyVer,
+        privacyAcceptedAt: nextPrivacyAt
       }));
 
       return { success: true };
@@ -1210,39 +1212,47 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       const text = await res.text();
       const data = text ? JSON.parse(text) : {};
-      const updated = data?.profile;
+      if (!res.ok || !data.success) {
+        return {
+          success: false,
+          error: data.message || "Impossible d'enregistrer la fin de configuration dans votre profil Firestore."
+        };
+      }
 
-      const updatedAuth: UserAuth = {
+      const updated = data?.profile || {};
+      const completedAt = updated.onboardingCompletedAt || new Date().toISOString();
+
+      setFirestoreUserDoc(prev =>
+        prev
+          ? {
+              ...prev,
+              onboardingCompleted: true,
+              onboardingCompletedAt: completedAt,
+              onboardingStep: step
+            }
+          : prev
+      );
+
+      saveAuth({
         ...auth,
         onboardingCompleted: true,
-        onboardingCompletedAt: updated?.onboardingCompletedAt || new Date().toISOString(),
+        onboardingCompletedAt: completedAt,
         onboardingStep: step
-      };
-      saveAuth(updatedAuth);
+      });
 
       setProfile(prev => ({
         ...prev,
         onboardingCompleted: true,
-        onboardingCompletedAt: updated?.onboardingCompletedAt || new Date().toISOString(),
+        onboardingCompletedAt: completedAt,
         onboardingStep: step
       }));
 
       return { success: true };
     } catch (err) {
-      const updatedAuth: UserAuth = {
-        ...auth,
-        onboardingCompleted: true,
-        onboardingCompletedAt: new Date().toISOString(),
-        onboardingStep: step
+      return {
+        success: false,
+        error: "Erreur réseau : impossible d'enregistrer la fin de configuration sur le serveur."
       };
-      saveAuth(updatedAuth);
-      setProfile(prev => ({
-        ...prev,
-        onboardingCompleted: true,
-        onboardingCompletedAt: new Date().toISOString(),
-        onboardingStep: step
-      }));
-      return { success: true };
     }
   };
 
@@ -1262,36 +1272,448 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const reauthenticate = async (password: string): Promise<boolean> => {
-    return password.length >= 6;
+    const fbUser = firebaseAuth.currentUser;
+    if (!fbUser || !fbUser.email) {
+      if (auth.uid === 'designer_001' && isDemoRef.current) {
+        return password.length >= 6;
+      }
+      return false;
+    }
+    if (!password) return false;
+
+    try {
+      const cred = EmailAuthProvider.credential(fbUser.email, password);
+      await reauthenticateWithCredential(fbUser, cred);
+      return true;
+    } catch (err: any) {
+      console.warn('[reauthenticate] Failed:', err?.code || err?.message);
+      return false;
+    }
   };
 
-  // Profile
-  const [profile, setProfile] = useState<DesignerProfile>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.PROFILE);
-    if (saved) {
-      try { return JSON.parse(saved); } catch {}
+  const reauthenticateWithGoogle = async (): Promise<boolean> => {
+    const fbUser = firebaseAuth.currentUser;
+    if (!fbUser) {
+      if (auth.uid === 'designer_001' && isDemoRef.current) {
+        return true;
+      }
+      return false;
     }
-    return INITIAL_DESIGNER_PROFILE;
-  });
+    try {
+      const provider = new GoogleAuthProvider();
+      provider.setCustomParameters({ prompt: 'select_account' });
+      await reauthenticateWithPopup(fbUser, provider);
+      return true;
+    } catch (err: any) {
+      console.warn('[reauthenticateWithGoogle] Failed:', err?.code || err?.message);
+      return false;
+    }
+  };
+
+  const linkGoogleFromSettings = async (): Promise<{ success: boolean; error?: string }> => {
+    const fbUser = firebaseAuth.currentUser;
+    if (!fbUser) {
+      return { success: false, error: 'Session Firebase introuvable.' };
+    }
+    try {
+      const provider = new GoogleAuthProvider();
+      provider.setCustomParameters({ prompt: 'select_account' });
+      await linkWithPopup(fbUser, provider);
+
+      try {
+        const idToken = await fbUser.getIdToken(true);
+        await fetch('/api/auth/notify-provider-linked', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${idToken}`
+          },
+          body: JSON.stringify({ addedProvider: 'google', forceNotify: true })
+        });
+      } catch (notifyErr) {
+        console.warn('[linkGoogleFromSettings] notify notice:', notifyErr);
+      }
+
+      await loadFirestoreUserProfile(fbUser, { providerHint: 'google' });
+      return { success: true };
+    } catch (err: any) {
+      const code = err?.code;
+      if (code === 'auth/provider-already-linked') {
+        return { success: false, error: 'Votre compte Google est déjà relié.' };
+      }
+      if (code === 'auth/credential-already-in-use') {
+        return { success: false, error: 'Ce compte Google est déjà associé à un autre compte.' };
+      }
+      if (code === 'auth/popup-closed-by-user') {
+        return { success: false, error: 'Fenêtre Google fermée avant confirmation.' };
+      }
+      return { success: false, error: 'Impossible de relier le compte Google pour le moment.' };
+    }
+  };
+
+  const ensureSensitiveReauth = async (options?: {
+    currentPassword?: string;
+    useGoogleReauth?: boolean;
+  }): Promise<{ ok: boolean; error?: string }> => {
+    if (options?.useGoogleReauth) {
+      const ok = await reauthenticateWithGoogle();
+      return ok ? { ok: true } : { ok: false, error: 'Ré-authentification Google requise.' };
+    }
+    if (options?.currentPassword) {
+      const ok = await reauthenticate(options.currentPassword);
+      return ok ? { ok: true } : { ok: false, error: 'Mot de passe actuel incorrect.' };
+    }
+    return { ok: false, error: 'Nouvelle authentification requise avant cette action sensible.' };
+  };
+
+  const changeAccountPassword = async (
+    newPassword: string,
+    options?: { currentPassword?: string; useGoogleReauth?: boolean }
+  ): Promise<{ success: boolean; error?: string }> => {
+    const fbUser = firebaseAuth.currentUser;
+    if (!fbUser) {
+      if (auth.uid === 'designer_001' && isDemoRef.current) {
+        return { success: true };
+      }
+      return { success: false, error: 'Session expirée. Veuillez vous reconnecter.' };
+    }
+
+    const hadPasswordBefore = (fbUser.providerData || []).some(p => p.providerId === 'password');
+    if (options?.currentPassword || options?.useGoogleReauth) {
+      const reauthRes = await ensureSensitiveReauth(options);
+      if (!reauthRes.ok) {
+        return { success: false, error: reauthRes.error };
+      }
+    }
+
+    try {
+      await updatePassword(fbUser, newPassword);
+      if (!hadPasswordBefore) {
+        try {
+          const idToken = await fbUser.getIdToken(true);
+          await fetch('/api/auth/notify-provider-linked', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${idToken}`
+            },
+            body: JSON.stringify({ addedProvider: 'password', forceNotify: true })
+          });
+        } catch {}
+      }
+      return { success: true };
+    } catch (err: any) {
+      if (err?.code === 'auth/requires-recent-login') {
+        return { success: false, error: 'Veuillez confirmer à nouveau votre identité avant de modifier le mot de passe.' };
+      }
+      if (err?.code === 'auth/weak-password') {
+        return { success: false, error: 'Mot de passe trop faible.' };
+      }
+      return { success: false, error: err?.message || 'Impossible de modifier le mot de passe.' };
+    }
+  };
+
+  const changeAccountEmail = async (
+    newEmail: string,
+    options?: { currentPassword?: string; useGoogleReauth?: boolean }
+  ): Promise<{ success: boolean; error?: string }> => {
+    const cleanEmail = newEmail.trim().toLowerCase();
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      return { success: false, error: 'Adresse email invalide.' };
+    }
+
+    const fbUser = firebaseAuth.currentUser;
+    if (!fbUser) {
+      if (auth.uid === 'designer_001' && isDemoRef.current) {
+        return { success: true };
+      }
+      return { success: false, error: 'Session expirée.' };
+    }
+
+    if (options?.currentPassword || options?.useGoogleReauth) {
+      const reauthRes = await ensureSensitiveReauth(options);
+      if (!reauthRes.ok) {
+        return { success: false, error: reauthRes.error };
+      }
+    }
+
+    try {
+      const actionUrl = typeof window !== 'undefined' ? `${window.location.origin}/` : undefined;
+      if (actionUrl) {
+        try {
+          await verifyBeforeUpdateEmail(fbUser, cleanEmail, { url: actionUrl });
+        } catch (uriErr: any) {
+          if (
+            uriErr?.code === 'auth/unauthorized-continue-uri' ||
+            uriErr?.code === 'auth/invalid-continue-uri'
+          ) {
+            await verifyBeforeUpdateEmail(fbUser, cleanEmail);
+          } else {
+            throw uriErr;
+          }
+        }
+      } else {
+        await verifyBeforeUpdateEmail(fbUser, cleanEmail);
+      }
+      return { success: true };
+    } catch (err: any) {
+      if (err?.code === 'auth/requires-recent-login') {
+        return { success: false, error: 'Une nouvelle authentification est requise pour modifier votre adresse email.' };
+      }
+      if (err?.code === 'auth/email-already-in-use') {
+        return { success: false, error: 'Cette adresse email est déjà utilisée par un autre compte.' };
+      }
+      if (err?.code === 'auth/invalid-email') {
+        return { success: false, error: 'Format d’adresse email invalide.' };
+      }
+      return { success: false, error: err?.message || 'Impossible de modifier l’adresse email.' };
+    }
+  };
+
+  const deleteOwnAccount = async (
+    options?: { currentPassword?: string; useGoogleReauth?: boolean }
+  ): Promise<{ success: boolean; error?: string }> => {
+    const fbUser = firebaseAuth.currentUser;
+    if (!fbUser) {
+      if (auth.uid === 'designer_001' && isDemoRef.current) {
+        await logout();
+        return { success: true };
+      }
+      return { success: false, error: 'Session expirée.' };
+    }
+
+    if (options?.currentPassword || options?.useGoogleReauth) {
+      const reauthRes = await ensureSensitiveReauth(options);
+      if (!reauthRes.ok) {
+        return { success: false, error: reauthRes.error };
+      }
+    }
+
+    try {
+      const freshToken = await fbUser.getIdToken(true);
+      const res = await fetch('/api/account/delete', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${freshToken}`
+        }
+      });
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
+
+      if (!res.ok || !data.success) {
+        return {
+          success: false,
+          error: data.message || 'Impossible de supprimer le compte. Veuillez vous ré-authentifier.'
+        };
+      }
+
+      await logout();
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Erreur lors de la suppression du compte.' };
+    }
+  };
+
+  const revokeAllDevices = async (): Promise<{ success: boolean; error?: string }> => {
+    const fbUser = firebaseAuth.currentUser;
+    if (!fbUser) {
+      await logout();
+      return { success: true };
+    }
+    try {
+      const idToken = await fbUser.getIdToken(true);
+      const res = await fetch('/api/auth/revoke-sessions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`
+        }
+      });
+      if (!res.ok) {
+        return { success: false, error: 'Impossible de révoquer les appareils.' };
+      }
+      await logout();
+      return { success: true };
+    } catch {
+      return { success: false, error: 'Erreur réseau lors de la révocation.' };
+    }
+  };
+
+  // Profile (JAMAIS initialisé depuis localStorage)
+  const [profile, setProfile] = useState<DesignerProfile>(EMPTY_DESIGNER_PROFILE);
 
   const updateProfile = (updates: Partial<DesignerProfile>) => {
     setProfile(prev => {
       const next = { ...prev, ...updates };
-      localStorage.setItem(STORAGE_KEYS.PROFILE, JSON.stringify(next));
-      if (auth.email) {
-        localStorage.setItem(`${STORAGE_KEYS.PROFILE}_${auth.email.toLowerCase()}`, JSON.stringify(next));
-      }
       return next;
     });
+
+    // Synchroniser les champs autorisés dans users/{uid} sur Firestore pour un utilisateur vérifié
+    const fbUser = firebaseAuth.currentUser;
+    if (fbUser && fbUser.uid !== 'designer_001' && (firestoreUserDoc?.emailVerified || fbUser.emailVerified)) {
+      const firestoreUpdates: Record<string, any> = {};
+      Object.entries(updates).forEach(([k, v]) => {
+        if (FIRESTORE_USER_ALLOWED_UPDATE_KEYS.has(k) && v !== undefined) {
+          firestoreUpdates[k] = v;
+        }
+      });
+      if (Object.keys(firestoreUpdates).length > 0) {
+        firestoreUpdates.updatedAt = new Date().toISOString();
+        firestoreSetDoc(firestoreDoc(db, 'users', fbUser.uid), firestoreUpdates, { merge: true }).catch(err => {
+          console.warn('[updateProfile Firestore sync notice]:', err?.message || err);
+        });
+      }
+    }
   };
 
-  // Synchronisation avec Firebase Authentication et le profil permanent serveur
-  useEffect(() => {
-    let isCancelled = false;
+  // Applique le profil Firestore users/{uid} à tous les états de l'application (source unique de vérité)
+  const applyUserDataFromFirestore = (
+    firebaseUser: any,
+    userData: Record<string, any>,
+    options?: {
+      fallbackEmail?: string;
+      fallbackDisplayName?: string;
+      providerHint?: string;
+    }
+  ): FirestoreUserGateProfile => {
+    const emailClean = (userData?.email || firebaseUser.email || options?.fallbackEmail || '').trim().toLowerCase();
+    const isSuper = userData?.role === 'superadmin' || isSuperAdminUser(emailClean);
+    const gate = extractFirestoreGateProfile(
+      firebaseUser.uid,
+      emailClean,
+      userData,
+      Boolean(firebaseUser.emailVerified)
+    );
+    const providerIds: string[] = Array.isArray(firebaseUser.providerData)
+      ? firebaseUser.providerData
+          .map((p: any) => (p?.providerId === 'google.com' ? 'google' : p?.providerId === 'password' ? 'password' : p?.providerId))
+          .filter(Boolean)
+      : [];
+    const primaryProvider = options?.providerHint || (providerIds.includes('google') ? 'google' : 'password');
+    const resolvedName =
+      userData?.displayName ||
+      userData?.name ||
+      firebaseUser.displayName ||
+      options?.fallbackDisplayName ||
+      emailClean.split('@')[0] ||
+      'Graphiste';
+    const wsId = gate.workspaceId || `ws_${firebaseUser.uid.slice(0, 8)}`;
 
-    const unsubscribe = onAuthStateChanged(firebaseAuth, async (firebaseUser) => {
-      if (firebaseUser && firebaseUser.email) {
-        setIsAuthLoading(true);
+    setFirestoreUserDoc(gate);
+
+    saveAuth({
+      uid: firebaseUser.uid,
+      email: emailClean,
+      displayName: resolvedName,
+      photoURL: userData?.avatarUrl || userData?.photoURL || firebaseUser.photoURL || '',
+      isAuthenticated: true,
+      emailVerified: gate.emailVerified,
+      emailVerifiedAt: gate.emailVerified ? (userData?.emailVerifiedAt || new Date().toISOString()) : undefined,
+      provider: primaryProvider,
+      linkedProviders: providerIds.length > 0 ? providerIds : [primaryProvider],
+      workspaceId: wsId,
+      role: userData?.role || (isSuper ? 'superadmin' : 'owner'),
+      isSuperAdmin: isSuper,
+      termsAcceptedVersion: gate.termsAcceptedVersion || undefined,
+      termsAcceptedAt: gate.termsAcceptedAt || undefined,
+      privacyAcceptedVersion: gate.privacyAcceptedVersion || undefined,
+      privacyAcceptedAt: gate.privacyAcceptedAt || undefined,
+      onboardingCompleted: gate.onboardingCompleted,
+      onboardingCompletedAt: gate.onboardingCompletedAt || undefined,
+      onboardingStep: gate.onboardingStep ?? 1,
+      createdAt: userData?.createdAt || new Date().toISOString()
+    });
+
+    setProfile(prev => ({
+      ...EMPTY_DESIGNER_PROFILE,
+      ...prev,
+      ...userData,
+      id: firebaseUser.uid,
+      name: resolvedName,
+      studioName: userData?.studioName || prev.studioName || `Studio ${resolvedName}`,
+      email: emailClean,
+      emailVerified: gate.emailVerified,
+      emailVerifiedAt: userData?.emailVerifiedAt || undefined,
+      termsAcceptedVersion: gate.termsAcceptedVersion || undefined,
+      termsAcceptedAt: gate.termsAcceptedAt || undefined,
+      privacyAcceptedVersion: gate.privacyAcceptedVersion || undefined,
+      privacyAcceptedAt: gate.privacyAcceptedAt || undefined,
+      onboardingCompleted: gate.onboardingCompleted,
+      onboardingCompletedAt: gate.onboardingCompletedAt || undefined,
+      onboardingStep: gate.onboardingStep ?? 1,
+      workspaceId: wsId
+    }));
+
+    setAllWorkspaces(prev => {
+      if (prev.some(w => w.id === wsId)) return prev;
+      const wsFallback: Workspace = {
+        id: wsId,
+        name: userData?.studioName || `Studio ${resolvedName}`,
+        ownerId: firebaseUser.uid,
+        ownerEmail: emailClean,
+        planId: (userData?.plan as PlanId) || 'free',
+        planStatus: 'trial',
+        planBillingCycle: 'monthly',
+        planStartedAt: userData?.createdAt || new Date().toISOString(),
+        planRenewsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
+        trialEndsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
+        storageUsedMb: 0,
+        members: [{
+          userId: firebaseUser.uid,
+          email: emailClean,
+          name: resolvedName,
+          role: 'owner',
+          joinedAt: userData?.createdAt || new Date().toISOString()
+        }],
+        createdAt: userData?.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+      return [wsFallback, ...prev];
+    });
+
+    return gate;
+  };
+
+  // Charge users/{uid} depuis Firestore et écoute les modifications en direct (sans jamais récréer ni lire localStorage)
+  const loadFirestoreUserProfile = async (
+    firebaseUser: any,
+    options?: {
+      fallbackEmail?: string;
+      fallbackDisplayName?: string;
+      providerHint?: string;
+    }
+  ): Promise<FirestoreUserGateProfile | null> => {
+    const seq = authSessionSeqRef.current;
+    setCurrentFbUser(firebaseUser);
+    setIsAuthLoading(true);
+    setIsProfileLoaded(false);
+
+    let resolvedData: Record<string, any> | null = null;
+    const userRef = firestoreDoc(db, 'users', firebaseUser.uid);
+
+    try {
+      // 1. Lecture directe Firestore users/{uid} (depuis le serveur si possible)
+      try {
+        const directSnap = await firestoreGetDocFromServer(userRef);
+        if (directSnap.exists()) {
+          resolvedData = directSnap.data();
+        }
+      } catch {
+        try {
+          const cachedSnap = await firestoreGetDoc(userRef);
+          if (cachedSnap.exists()) {
+            resolvedData = cachedSnap.data();
+          }
+        } catch {}
+      }
+
+      // 2. Si le document users/{uid} n'existe pas encore ou si emailVerified Firebase doit être synchronisé -> appel idempotent serveur
+      const needsServerSync =
+        !resolvedData ||
+        (Boolean(firebaseUser.emailVerified) && !resolvedData.emailVerified);
+
+      if (needsServerSync) {
         try {
           const idToken = await firebaseUser.getIdToken();
           const profileRes = await fetch('/api/user/profile', {
@@ -1301,90 +1723,182 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           });
           const text = await profileRes.text();
           const data = text ? JSON.parse(text) : null;
-
-          if (!isCancelled && profileRes.ok && data?.success && data?.profile) {
-            const serverUser = data.profile;
-            const isSuper = serverUser.role === 'superadmin' || isSuperAdminUser(firebaseUser.email);
-            const verified = Boolean(firebaseUser.emailVerified || serverUser.emailVerified);
-
-            setAuth(prev => ({
-              ...prev,
-              uid: firebaseUser.uid,
-              email: firebaseUser.email || prev.email,
-              displayName: serverUser.displayName || firebaseUser.displayName || prev.displayName,
-              photoURL: firebaseUser.photoURL || prev.photoURL,
-              isAuthenticated: true,
-              emailVerified: verified,
-              emailVerifiedAt: serverUser.emailVerifiedAt || prev.emailVerifiedAt,
-              termsAcceptedVersion: serverUser.termsAcceptedVersion ?? prev.termsAcceptedVersion,
-              termsAcceptedAt: serverUser.termsAcceptedAt ?? prev.termsAcceptedAt,
-              privacyAcceptedVersion: serverUser.privacyAcceptedVersion ?? prev.privacyAcceptedVersion,
-              privacyAcceptedAt: serverUser.privacyAcceptedAt ?? prev.privacyAcceptedAt,
-              onboardingCompleted: serverUser.onboardingCompleted ?? prev.onboardingCompleted,
-              onboardingCompletedAt: serverUser.onboardingCompletedAt ?? prev.onboardingCompletedAt,
-              onboardingStep: serverUser.onboardingStep ?? prev.onboardingStep,
-              workspaceId: serverUser.workspaceId ?? prev.workspaceId,
-              role: serverUser.role ?? prev.role,
-              isSuperAdmin: isSuper
-            }));
-
-            setProfile(prev => ({
-              ...prev,
-              id: firebaseUser.uid,
-              name: serverUser.displayName || firebaseUser.displayName || prev.name,
-              studioName: serverUser.studioName || prev.studioName,
-              email: firebaseUser.email || prev.email,
-              emailVerified: verified,
-              emailVerifiedAt: serverUser.emailVerifiedAt ?? prev.emailVerifiedAt,
-              termsAcceptedVersion: serverUser.termsAcceptedVersion ?? prev.termsAcceptedVersion,
-              termsAcceptedAt: serverUser.termsAcceptedAt ?? prev.termsAcceptedAt,
-              privacyAcceptedVersion: serverUser.privacyAcceptedVersion ?? prev.privacyAcceptedVersion,
-              privacyAcceptedAt: serverUser.privacyAcceptedAt ?? prev.privacyAcceptedAt,
-              onboardingCompleted: serverUser.onboardingCompleted ?? prev.onboardingCompleted,
-              onboardingCompletedAt: serverUser.onboardingCompletedAt ?? prev.onboardingCompletedAt,
-              onboardingStep: serverUser.onboardingStep ?? prev.onboardingStep,
-              workspaceId: serverUser.workspaceId ?? prev.workspaceId
-            }));
-
-            // Synchronisation directe Firestore via le SDK client (autorisé par firestore.rules pour request.auth.uid == userId)
-            try {
-              const userRef = firestoreDoc(db, 'users', firebaseUser.uid);
-              firestoreSetDoc(userRef, {
-                uid: firebaseUser.uid,
-                email: firebaseUser.email,
-                displayName: serverUser.displayName || firebaseUser.displayName || '',
-                updatedAt: new Date().toISOString()
-              }, { merge: true }).catch(() => {});
-            } catch {}
+          if (profileRes.ok && data?.success && data?.profile) {
+            resolvedData = data.profile;
           }
         } catch (err) {
-          console.warn('[Profile Sync] Failed to fetch server profile:', err);
-        } finally {
-          if (!isCancelled) {
-            setIsAuthLoading(false);
+          console.warn('[Profile Sync] /api/user/profile notice:', err);
+        }
+      }
+
+      if (authSessionSeqRef.current !== seq) {
+        return null;
+      }
+
+      // 3. Attache un écouteur temps réel unique sur users/{uid} pour le garder toujours synchrone
+      if (activeUserListenerUidRef.current !== firebaseUser.uid) {
+        stopAllListeners();
+        activeUserListenerUidRef.current = firebaseUser.uid;
+        const unsubUserDoc = firestoreOnSnapshot(
+          userRef,
+          (snap) => {
+            if (authSessionSeqRef.current !== seq || !snap.exists()) return;
+            const liveData = snap.data();
+            applyUserDataFromFirestore(firebaseUser, liveData, options);
+            // Lecture workspace Firestore si présent
+            if (liveData?.workspaceId) {
+              firestoreGetDoc(firestoreDoc(db, 'workspaces', liveData.workspaceId))
+                .then(wsSnap => {
+                  if (authSessionSeqRef.current !== seq || !wsSnap.exists()) return;
+                  const wsData = wsSnap.data() as Workspace;
+                  setAllWorkspaces(prev => {
+                    const others = prev.filter(w => w.id !== wsData.id);
+                    return [wsData, ...others];
+                  });
+                })
+                .catch(() => {});
+            }
+          },
+          (err) => {
+            console.warn('[Firestore users/{uid} onSnapshot notice]:', err?.message || err);
           }
+        );
+        activeListenersRef.current.push(unsubUserDoc);
+      }
+
+      const fallbackDoc: Record<string, any> = resolvedData || {
+        uid: firebaseUser.uid,
+        email: firebaseUser.email || options?.fallbackEmail || '',
+        displayName: firebaseUser.displayName || options?.fallbackDisplayName || '',
+        emailVerified: Boolean(firebaseUser.emailVerified),
+        termsAcceptedVersion: null,
+        onboardingCompleted: false,
+        onboardingStep: 1
+      };
+
+      // Lecture workspace associé depuis Firestore si existant
+      if (fallbackDoc.workspaceId) {
+        try {
+          const wsSnap = await firestoreGetDoc(firestoreDoc(db, 'workspaces', fallbackDoc.workspaceId));
+          if (authSessionSeqRef.current === seq && wsSnap.exists()) {
+            const wsData = wsSnap.data() as Workspace;
+            setAllWorkspaces(prev => [wsData, ...prev.filter(w => w.id !== wsData.id)]);
+          }
+        } catch {}
+      }
+
+      const gate = applyUserDataFromFirestore(firebaseUser, fallbackDoc, options);
+      setIsProfileLoaded(true);
+      setIsAuthReady(true);
+      setIsAuthLoading(false);
+      return gate;
+    } catch (err) {
+      console.warn('[Profile Sync] Failed to load users/{uid} from Firestore:', err);
+      if (authSessionSeqRef.current === seq) {
+        setIsProfileLoaded(true);
+        setIsAuthReady(true);
+        setIsAuthLoading(false);
+      }
+      return null;
+    }
+  };
+
+  // Synchronisation unique au démarrage et sur changement d'état Firebase Auth
+  useEffect(() => {
+    let isCancelled = false;
+
+    const unsubscribeAuth = onAuthStateChanged(firebaseAuth, async (firebaseUser) => {
+      if (isCancelled) return;
+
+      if (firebaseUser && firebaseUser.email) {
+        isDemoRef.current = false;
+        if (isRegisteringRef.current) {
+          // registerWithEmail appelle loadFirestoreUserProfile après écriture serveur des conditions
+          return;
         }
+        await loadFirestoreUserProfile(firebaseUser);
       } else {
-        if (!isCancelled) {
+        if (isDemoRef.current) {
+          setIsAuthReady(true);
+          setIsProfileLoaded(true);
           setIsAuthLoading(false);
+          return;
         }
+        stopAllListeners();
+        setCurrentFbUser(null);
+        setFirestoreUserDoc(null);
+        setAuth(INITIAL_UNAUTHENTICATED_AUTH);
+        setProfile(EMPTY_DESIGNER_PROFILE);
+        setIsProfileLoaded(true);
+        setIsAuthReady(true);
+        setIsAuthLoading(false);
       }
     });
 
     return () => {
       isCancelled = true;
-      unsubscribe();
+      unsubscribeAuth();
+      stopAllListeners();
     };
   }, []);
 
-  // Clients
-  const [clients, setClients] = useState<Client[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.CLIENTS);
-    if (saved) {
-      try { return JSON.parse(saved); } catch {}
+  // Notifications (centralisées pour alertes de synchronisation cloud visibles)
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+
+  const saveNotifications = (next: NotificationItem[]) => {
+    setNotifications(next);
+    localStorage.setItem(STORAGE_KEYS.NOTIFICATIONS, JSON.stringify(next));
+  };
+
+  const addNotification = (notif: Omit<NotificationItem, 'id' | 'date' | 'read'>) => {
+    const newNotif: NotificationItem = {
+      ...notif,
+      id: `notif_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      date: new Date().toISOString(),
+      read: false
+    };
+    saveNotifications([newNotif, ...notifications]);
+  };
+
+  const markNotificationRead = (id: string) => {
+    saveNotifications(notifications.map(n => (n.id === id ? { ...n, read: true } : n)));
+  };
+
+  const markAllNotificationsRead = () => {
+    saveNotifications(notifications.map(n => ({ ...n, read: true })));
+  };
+
+  // Identifiant UID du propriétaire authentifié (token Firebase)
+  const getCurrentOwnerUid = (): string => {
+    return firebaseAuth.currentUser?.uid || auth.uid || currentWorkspace?.ownerId || '';
+  };
+
+  // Vérifie si la session actuelle est adossée à un compte Firebase authentifié (hors démo locale)
+  const canSyncToFirestore = (): boolean => {
+    const user = firebaseAuth.currentUser || currentFbUser;
+    if (!user || !user.uid) return false;
+    if (user.uid === 'designer_001') return false;
+    if (user.email && (user.email === 'contact@monstudio.fr' || user.email.includes('demo'))) return false;
+    return true;
+  };
+
+  // Gestionnaire d'erreur visible pour toutes les opérations Firestore
+  const handleCloudWriteError = (docType: string, err: unknown) => {
+    console.error(`[Firestore Cloud Error] ${docType}:`, err);
+    const errMsg = err instanceof Error ? err.message : String(err);
+    let userFriendlyMsg = `Échec de l'enregistrement (${docType}) sur le Cloud. Vérifiez votre connexion.`;
+    if (errMsg.includes('permission-denied') || errMsg.includes('insufficient permissions')) {
+      userFriendlyMsg = `Accès refusé par les règles de sécurité Firestore lors de la synchronisation de ${docType}.`;
     }
-    return INITIAL_CLIENTS;
-  });
+    addNotification({
+      type: 'alert',
+      title: 'Erreur de synchronisation Cloud',
+      message: userFriendlyMsg
+    });
+  };
+
+  // Clients
+  const [clients, setClients] = useState<Client[]>([]);
 
   const saveClients = (next: Client[]) => {
     setClients(next);
@@ -1393,9 +1907,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const addClient = (data: Omit<Client, 'id' | 'createdAt' | 'updatedAt'>): Client => {
     const now = new Date().toISOString();
+    const ownerId = getCurrentOwnerUid();
     const newClient: Client = {
       ...data,
       workspaceId: currentWorkspace.id,
+      ownerId,
       id: `client_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       createdAt: now,
       updatedAt: now
@@ -1403,11 +1919,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     saveClients([newClient, ...clients]);
 
     // Persistance asynchrone Firestore
-    firestoreSetDoc(firestoreDoc(db, 'clients', newClient.id), {
-      ...newClient,
-      ownerId: auth.uid || currentWorkspace.ownerId,
-      workspaceId: currentWorkspace.id
-    }).catch(err => console.warn('[Firestore] Client write notice:', err));
+    if (canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'clients', newClient.id), {
+        ...newClient,
+        ownerId,
+        workspaceId: currentWorkspace.id
+      }).catch(err => handleCloudWriteError('Client', err));
+    }
 
     return newClient;
   };
@@ -1416,8 +1934,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const updatedList = clients.map(c => (c.id === id ? { ...c, ...updates, updatedAt: new Date().toISOString() } : c));
     saveClients(updatedList);
     const updated = updatedList.find(c => c.id === id);
-    if (updated) {
-      firestoreSetDoc(firestoreDoc(db, 'clients', id), updated, { merge: true }).catch(() => {});
+    if (updated && canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'clients', id), updated, { merge: true })
+        .catch(err => handleCloudWriteError('Client', err));
     }
   };
 
@@ -1448,7 +1967,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return false;
     }
     saveClients(clients.filter(c => c.id !== id));
-    firestoreDeleteDoc(firestoreDoc(db, 'clients', id)).catch(() => {});
+    if (canSyncToFirestore()) {
+      firestoreDeleteDoc(firestoreDoc(db, 'clients', id))
+        .catch(err => handleCloudWriteError('Client', err));
+    }
     return true;
   };
 
@@ -1511,22 +2033,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     depositAmount: p.depositAmount ?? 0,
     budget: p.budget ?? 0,
     clientLinkActive: p.clientLinkActive ?? true,
-    clientShareToken: p.clientShareToken || `tok_${Math.random().toString(36).substring(2, 9)}`
+    clientShareToken: p.clientShareToken || ''
   });
 
   // Projects
-  const [projects, setProjects] = useState<Project[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.PROJECTS);
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed.map(normalizeProject);
-        }
-      } catch {}
-    }
-    return INITIAL_PROJECTS.map(normalizeProject);
-  });
+  const [projects, setProjects] = useState<Project[]>([]);
 
   const saveProjects = (next: Project[]) => {
     setProjects(next);
@@ -1538,12 +2049,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (projects.length > 0) {
       const existingClientIds = new Set(clients.map(c => c.id));
       const missingClients: Client[] = [];
+      const ownerId = getCurrentOwnerUid();
       projects.forEach(p => {
         if (p.clientId && !existingClientIds.has(p.clientId)) {
           const fallbackCompany = p.title.split('—')[0]?.trim() || p.title.split('-')[0]?.trim() || 'Client Entreprise';
           const newClient: Client = {
             id: p.clientId,
             workspaceId: p.workspaceId || 'ws_default',
+            ownerId,
             name: fallbackCompany,
             company: fallbackCompany,
             email: `contact@${fallbackCompany.toLowerCase().replace(/[^a-z0-9]/g, '') || 'client'}.com`,
@@ -1564,21 +2077,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [projects.length]);
 
   // Quotes
-  const [quotes, setQuotes] = useState<Quote[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.QUOTES);
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) {
-          return parsed.map((q: any) => ({
-            ...q,
-            lines: Array.isArray(q.lines) ? q.lines : []
-          }));
-        }
-      } catch {}
-    }
-    return INITIAL_QUOTES;
-  });
+  const [quotes, setQuotes] = useState<Quote[]>([]);
 
   const saveQuotes = (next: Quote[]) => {
     setQuotes(next);
@@ -1586,61 +2085,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   // Invoices
-  const [invoices, setInvoices] = useState<Invoice[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.INVOICES);
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) {
-          return parsed.map((inv: any) => ({
-            ...inv,
-            lines: Array.isArray(inv.lines) ? inv.lines : [],
-            payments: Array.isArray(inv.payments) ? inv.payments : []
-          }));
-        }
-      } catch {}
-    }
-    return INITIAL_INVOICES;
-  });
+  const [invoices, setInvoices] = useState<Invoice[]>([]);
 
   const saveInvoices = (next: Invoice[]) => {
     setInvoices(next);
     localStorage.setItem(STORAGE_KEYS.INVOICES, JSON.stringify(next));
-  };
-
-  // Notifications
-  const [notifications, setNotifications] = useState<NotificationItem[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.NOTIFICATIONS);
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
-      } catch {}
-    }
-    return INITIAL_NOTIFICATIONS;
-  });
-
-  const saveNotifications = (next: NotificationItem[]) => {
-    setNotifications(next);
-    localStorage.setItem(STORAGE_KEYS.NOTIFICATIONS, JSON.stringify(next));
-  };
-
-  const addNotification = (notif: Omit<NotificationItem, 'id' | 'date' | 'read'>) => {
-    const newNotif: NotificationItem = {
-      ...notif,
-      id: `notif_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-      date: new Date().toISOString(),
-      read: false
-    };
-    saveNotifications([newNotif, ...notifications]);
-  };
-
-  const markNotificationRead = (id: string) => {
-    saveNotifications(notifications.map(n => (n.id === id ? { ...n, read: true } : n)));
-  };
-
-  const markAllNotificationsRead = () => {
-    saveNotifications(notifications.map(n => ({ ...n, read: true })));
   };
 
   // Add Project
@@ -1649,9 +2098,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   ): Project => {
     const now = new Date().toISOString();
     const client = clients.find(c => c.id === data.clientId);
-    const clientPrefix = client ? ((client.company || client.name || 'cli').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 4) || 'cli') : 'cli';
-    const randToken = `${clientPrefix}-${Math.random().toString(36).substring(2, 9)}-${Math.random().toString(36).substring(2, 8)}`;
-    
     const lines = Array.isArray(data.lines) ? data.lines : [];
     let calculatedBudget = data.budget ?? 0;
     let subtotalHT = data.subtotalHT ?? calculatedBudget;
@@ -1670,12 +2116,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       depositAmount = Math.round(totalTTC * (pct / 100));
     }
 
+    const ownerId = getCurrentOwnerUid();
+    // Les jetons de partage sont générés exclusivement côté serveur (crypto.randomBytes(32))
     const newProject: Project = {
       ...data,
       workspaceId: currentWorkspace.id,
+      ownerId,
       id: `proj_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      clientShareToken: randToken,
-      clientLinkActive: true,
+      clientShareToken: '',
+      clientLinkActive: false,
       lines,
       budget: calculatedBudget,
       subtotalHT,
@@ -1716,11 +2165,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     saveProjects([newProject, ...projects]);
 
     // Persistance asynchrone Firestore
-    firestoreSetDoc(firestoreDoc(db, 'projects', newProject.id), {
-      ...newProject,
-      ownerId: auth.uid || currentWorkspace.ownerId,
-      workspaceId: currentWorkspace.id
-    }).catch(err => console.warn('[Firestore] Project write notice:', err));
+    if (canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'projects', newProject.id), {
+        ...newProject,
+        ownerId,
+        workspaceId: currentWorkspace.id
+      }).catch(err => handleCloudWriteError('Projet', err));
+    }
 
     return newProject;
   };
@@ -1747,8 +2198,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
     saveProjects(updatedList);
     const updated = updatedList.find(p => p.id === id);
-    if (updated) {
-      firestoreSetDoc(firestoreDoc(db, 'projects', id), updated, { merge: true }).catch(() => {});
+    if (updated && canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'projects', id), updated, { merge: true })
+        .catch(err => handleCloudWriteError('Projet', err));
     }
   };
 
@@ -1759,7 +2211,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return false;
     }
     saveProjects(projects.filter(p => p.id !== id));
-    firestoreDeleteDoc(firestoreDoc(db, 'projects', id)).catch(() => {});
+    if (canSyncToFirestore()) {
+      firestoreDeleteDoc(firestoreDoc(db, 'projects', id))
+        .catch(err => handleCloudWriteError('Projet', err));
+    }
     return true;
   };
 
@@ -1795,21 +2250,47 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const getProjectById = (id: string) => projects.find(p => p.id === id);
   const getProjectByShareToken = (token: string) => projects.find(p => p.clientShareToken === token && p.clientLinkActive);
 
-  const regenerateShareToken = (projectId: string): string => {
-    const project = projects.find(p => p.id === projectId);
-    const client = project ? clients.find(c => c.id === project.clientId) : undefined;
-    const clientPrefix = client ? ((client.company || client.name || 'cli').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 4) || 'cli') : 'cli';
-    const newToken = `${clientPrefix}-${Math.random().toString(36).substring(2, 9)}-${Math.random().toString(36).substring(2, 8)}`;
-    
-    updateProject(projectId, { clientShareToken: newToken });
-    return newToken;
+  const regenerateShareToken = async (projectId: string): Promise<string> => {
+    try {
+      const idToken = await firebaseAuth.currentUser?.getIdToken();
+      const res = await fetch(`/api/projects/${projectId}/portal-token`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { 'Authorization': `Bearer ${idToken}` } : {})
+        }
+      });
+      const data = await res.json();
+      if (data.success && data.token) {
+        setProjects(prev => prev.map(p => p.id === projectId ? { ...p, clientShareToken: data.token, clientLinkActive: true } : p));
+        return data.token;
+      }
+    } catch (e) {
+      console.error('Erreur génération sécurisée jeton portail:', e);
+    }
+    return '';
   };
 
-  const toggleShareLinkActive = (projectId: string) => {
+  const toggleShareLinkActive = async (projectId: string): Promise<void> => {
     const project = projects.find(p => p.id === projectId);
-    if (project) {
-      updateProject(projectId, { clientLinkActive: !project.clientLinkActive });
+    if (!project) return;
+    const nextStatus = !project.clientLinkActive;
+    try {
+      const idToken = await firebaseAuth.currentUser?.getIdToken();
+      if (idToken) {
+        await fetch(`/api/projects/${projectId}/portal-link-status`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${idToken}`
+          },
+          body: JSON.stringify({ active: nextStatus })
+        });
+      }
+    } catch (e) {
+      console.error('Erreur bascule statut lien client:', e);
     }
+    setProjects(prev => prev.map(p => p.id === projectId ? { ...p, clientLinkActive: nextStatus } : p));
   };
 
   const archiveProject = (projectId: string) => {
@@ -2214,10 +2695,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const projectQuotes = quotes.filter(q => q.projectId === quoteData.projectId);
     const version = quoteData.version || (projectQuotes.length + 1);
     const status = quoteData.status || 'draft'; // Statut Brouillon par défaut dès la création
+    const ownerId = getCurrentOwnerUid();
 
     const newQuote: Quote = {
       ...quoteData,
       workspaceId: currentWorkspace.id,
+      ownerId,
       id: `quote_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       quoteNumber,
       version,
@@ -2236,7 +2719,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     saveQuotes([newQuote, ...quotes]);
-    firestoreSetDoc(firestoreDoc(db, 'quotes', newQuote.id), newQuote).catch(() => {});
+    if (canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'quotes', newQuote.id), newQuote)
+        .catch(err => handleCloudWriteError('Devis', err));
+    }
 
     addActivity(quoteData.projectId, {
       title: `Devis ${quoteNumber} (${version > 1 ? `V${version} · ` : ''}${status === 'draft' ? 'Brouillon' : 'Émis'})`,
@@ -2284,7 +2770,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     const updatedQuote = { ...existing, ...calculatedUpdates };
     saveQuotes(quotes.map(q => (q.id === id ? updatedQuote : q)));
-    firestoreSetDoc(firestoreDoc(db, 'quotes', id), updatedQuote).catch(() => {});
+    if (canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'quotes', id), updatedQuote)
+        .catch(err => handleCloudWriteError('Devis', err));
+    }
   };
 
   const deleteQuote = (id: string) => {
@@ -2294,7 +2783,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return;
     }
     saveQuotes(quotes.filter(q => q.id !== id));
-    firestoreDeleteDoc(firestoreDoc(db, 'quotes', id)).catch(() => {});
+    if (canSyncToFirestore()) {
+      firestoreDeleteDoc(firestoreDoc(db, 'quotes', id))
+        .catch(err => handleCloudWriteError('Devis', err));
+    }
   };
 
   const duplicateQuote = (id: string): Quote => {
@@ -2322,9 +2814,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     const existingNumbers = quotes.map(q => q.quoteNumber);
     const quoteNumber = generateNextDocumentNumber(existingNumbers, 'DEV', new Date().getFullYear(), profile.quotePrefix);
+    const ownerId = getCurrentOwnerUid();
 
     const versionQuote: Quote = {
       ...original,
+      workspaceId: currentWorkspace.id,
+      ownerId,
       id: `quote_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       quoteNumber,
       version: nextVer,
@@ -2339,7 +2834,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     saveQuotes([versionQuote, ...quotes]);
-    firestoreSetDoc(firestoreDoc(db, 'quotes', versionQuote.id), versionQuote).catch(() => {});
+    if (canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'quotes', versionQuote.id), versionQuote)
+        .catch(err => handleCloudWriteError('Version Devis', err));
+    }
 
     addActivity(original.projectId, {
       title: `Nouvelle version devis : ${quoteNumber} (V${nextVer})`,
@@ -2380,12 +2878,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
 
     saveQuotes(updatedQuotes);
-    firestoreSetDoc(firestoreDoc(db, 'quotes', quoteId), {
-      status: 'accepted',
-      isLocked: true,
-      acceptedAt: now,
-      acceptedByName
-    }, { merge: true }).catch(() => {});
+    if (canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'quotes', quoteId), {
+        status: 'accepted',
+        isLocked: true,
+        acceptedAt: now,
+        acceptedByName
+      }, { merge: true }).catch(err => handleCloudWriteError('Acceptation Devis', err));
+    }
 
     // Synchronisation du projet : avance à "devis_accepte" et synchronise budget et lignes
     const project = projects.find(p => p.id === quote.projectId);
@@ -2465,10 +2965,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const status = invoiceData.status || 'sent';
     // Règle fiscale : dès qu'une facture est émise (non draft), elle est scellée / inaltérable
     const isLocked = status !== 'draft';
+    const ownerId = getCurrentOwnerUid();
 
     const newInvoice: Invoice = {
       ...invoiceData,
       workspaceId: currentWorkspace.id,
+      ownerId,
       id: `inv_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       invoiceNumber,
       subtotal: totals.subtotalHT,
@@ -2488,7 +2990,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     saveInvoices([newInvoice, ...invoices]);
-    firestoreSetDoc(firestoreDoc(db, 'invoices', newInvoice.id), newInvoice).catch(() => {});
+    if (canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'invoices', newInvoice.id), newInvoice)
+        .catch(err => handleCloudWriteError('Facture', err));
+    }
 
     addActivity(invoiceData.projectId, {
       title: `Facture ${invoiceNumber} émise`,
@@ -2600,7 +3105,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
     const updated = { ...inv, ...updates };
     saveInvoices(invoices.map(i => (i.id === id ? updated : i)));
-    firestoreSetDoc(firestoreDoc(db, 'invoices', id), updated).catch(() => {});
+    if (canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'invoices', id), updated)
+        .catch(err => handleCloudWriteError('Facture', err));
+    }
   };
 
   const deleteInvoice = (id: string) => {
@@ -2611,7 +3119,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return;
     }
     saveInvoices(invoices.filter(i => i.id !== id));
-    firestoreDeleteDoc(firestoreDoc(db, 'invoices', id)).catch(() => {});
+    if (canSyncToFirestore()) {
+      firestoreDeleteDoc(firestoreDoc(db, 'invoices', id))
+        .catch(err => handleCloudWriteError('Facture', err));
+    }
   };
 
   const cancelInvoiceWithCreditNote = (invoiceId: string, reason?: string): { cancelledInvoice: Invoice; creditNote: Invoice } => {
@@ -2620,9 +3131,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     const now = new Date().toISOString();
     const cancellationReason = reason || 'Annulation légale & émission d’un avoir rectificatif';
+    const ownerId = getCurrentOwnerUid();
 
     const cancelledInvoice: Invoice = {
       ...invoice,
+      ownerId: invoice.ownerId || ownerId,
       status: 'cancelled',
       isCancelled: true,
       cancelledAt: now,
@@ -2635,6 +3148,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const creditNote: Invoice = {
       id: `inv_cn_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       workspaceId: currentWorkspace.id,
+      ownerId,
       invoiceNumber: creditNoteNumber,
       type: 'credit_note',
       quoteId: invoice.quoteId,
@@ -2669,8 +3183,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const updatedInvoices = [creditNote, ...invoices.map(i => (i.id === invoiceId ? cancelledInvoice : i))];
     saveInvoices(updatedInvoices);
 
-    firestoreSetDoc(firestoreDoc(db, 'invoices', cancelledInvoice.id), cancelledInvoice).catch(() => {});
-    firestoreSetDoc(firestoreDoc(db, 'invoices', creditNote.id), creditNote).catch(() => {});
+    if (canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'invoices', cancelledInvoice.id), cancelledInvoice)
+        .catch(err => handleCloudWriteError('Facture annulée', err));
+      firestoreSetDoc(firestoreDoc(db, 'invoices', creditNote.id), creditNote)
+        .catch(err => handleCloudWriteError('Avoir rectificatif', err));
+    }
 
     addActivity(invoice.projectId, {
       title: `Facture ${invoice.invoiceNumber} annulée`,
@@ -2694,9 +3212,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const invoice = invoices.find(inv => inv.id === invoiceId);
     if (!invoice) return;
 
+    const ownerId = getCurrentOwnerUid();
     const newPayment: PaymentRecord = {
       ...paymentData,
       id: `pay_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      ownerId,
       invoiceId,
       recordedBy: profile.name
     };
@@ -2714,7 +3234,27 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     saveInvoices(invoices.map(inv => (inv.id === invoiceId ? updatedInvoice : inv)));
-    firestoreSetDoc(firestoreDoc(db, 'invoices', invoiceId), updatedInvoice).catch(() => {});
+    if (canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'invoices', invoiceId), updatedInvoice)
+        .catch(err => handleCloudWriteError('Facture', err));
+
+      // Persistance dans la collection /payments/{paymentId} selon firestore.rules
+      firestoreSetDoc(firestoreDoc(db, 'payments', newPayment.id), {
+        id: newPayment.id,
+        ownerId,
+        workspaceId: currentWorkspace.id,
+        invoiceId,
+        projectId: invoice.projectId,
+        clientId: invoice.clientId,
+        amount: paymentData.amount,
+        date: paymentData.date,
+        method: paymentData.method,
+        reference: paymentData.reference || '',
+        notes: paymentData.notes || '',
+        recordedBy: profile.name,
+        createdAt: new Date().toISOString()
+      }).catch(err => handleCloudWriteError('Paiement', err));
+    }
 
     // Mise à jour de l'avancement financier et livrables du projet
     const project = projects.find(p => p.id === invoice.projectId);
@@ -2856,13 +3396,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Stage 3 State Implementations
   // 1. Appointments
-  const [appointments, setAppointments] = useState<ClientAppointment[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.APPOINTMENTS);
-    if (saved) {
-      try { return JSON.parse(saved); } catch {}
-    }
-    return INITIAL_APPOINTMENTS;
-  });
+  const [appointments, setAppointments] = useState<ClientAppointment[]>([]);
 
   const saveAppointments = (next: ClientAppointment[]) => {
     setAppointments(next);
@@ -2870,26 +3404,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const addAppointment = (aptData: Omit<ClientAppointment, 'id'>): ClientAppointment => {
+    const ownerId = getCurrentOwnerUid();
     const newApt: ClientAppointment = {
       ...aptData,
+      workspaceId: currentWorkspace.id,
+      ownerId,
       id: `apt_${Date.now()}`
     };
     saveAppointments([newApt, ...appointments]);
+    if (canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'appointments', newApt.id), newApt)
+        .catch(err => handleCloudWriteError('Rendez-vous', err));
+    }
     return newApt;
   };
 
   const deleteAppointment = (id: string) => {
     saveAppointments(appointments.filter(a => a.id !== id));
+    if (canSyncToFirestore()) {
+      firestoreDeleteDoc(firestoreDoc(db, 'appointments', id))
+        .catch(err => handleCloudWriteError('Rendez-vous', err));
+    }
   };
 
   // 2. Time Entries
-  const [timeEntries, setTimeEntries] = useState<TimeEntry[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.TIME_ENTRIES);
-    if (saved) {
-      try { return JSON.parse(saved); } catch {}
-    }
-    return INITIAL_TIME_ENTRIES;
-  });
+  const [timeEntries, setTimeEntries] = useState<TimeEntry[]>([]);
 
   const saveTimeEntries = (next: TimeEntry[]) => {
     setTimeEntries(next);
@@ -2897,26 +3436,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const addTimeEntry = (entryData: Omit<TimeEntry, 'id'>): TimeEntry => {
+    const ownerId = getCurrentOwnerUid();
     const newEntry: TimeEntry = {
       ...entryData,
+      workspaceId: currentWorkspace.id,
+      ownerId,
       id: `time_${Date.now()}`
     };
     saveTimeEntries([newEntry, ...timeEntries]);
+    if (canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'time_entries', newEntry.id), newEntry)
+        .catch(err => handleCloudWriteError('Saisie de temps', err));
+    }
     return newEntry;
   };
 
   const deleteTimeEntry = (id: string) => {
     saveTimeEntries(timeEntries.filter(t => t.id !== id));
+    if (canSyncToFirestore()) {
+      firestoreDeleteDoc(firestoreDoc(db, 'time_entries', id))
+        .catch(err => handleCloudWriteError('Saisie de temps', err));
+    }
   };
 
   // 3. Expenses
-  const [expenses, setExpenses] = useState<ProjectExpense[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.EXPENSES);
-    if (saved) {
-      try { return JSON.parse(saved); } catch {}
-    }
-    return INITIAL_EXPENSES;
-  });
+  const [expenses, setExpenses] = useState<ProjectExpense[]>([]);
 
   const saveExpenses = (next: ProjectExpense[]) => {
     setExpenses(next);
@@ -2924,16 +3468,27 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const addExpense = (expData: Omit<ProjectExpense, 'id'>): ProjectExpense => {
+    const ownerId = getCurrentOwnerUid();
     const newExp: ProjectExpense = {
       ...expData,
+      workspaceId: currentWorkspace.id,
+      ownerId,
       id: `exp_${Date.now()}`
     };
     saveExpenses([newExp, ...expenses]);
+    if (canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'expenses', newExp.id), newExp)
+        .catch(err => handleCloudWriteError('Dépense', err));
+    }
     return newExp;
   };
 
   const deleteExpense = (id: string) => {
     saveExpenses(expenses.filter(e => e.id !== id));
+    if (canSyncToFirestore()) {
+      firestoreDeleteDoc(firestoreDoc(db, 'expenses', id))
+        .catch(err => handleCloudWriteError('Dépense', err));
+    }
   };
 
   // 4. Leads
@@ -3026,23 +3581,38 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   // 7. Payments & Audit
-  const [paymentTransactions, setPaymentTransactions] = useState<PaymentTransaction[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.PAYMENTS);
-    if (saved) {
-      try { return JSON.parse(saved); } catch {}
-    }
-    return INITIAL_PAYMENT_TRANSACTIONS;
-  });
+  const [paymentTransactions, setPaymentTransactions] = useState<PaymentTransaction[]>([]);
 
   const recordOnlinePayment = (txData: Omit<PaymentTransaction, 'id' | 'date'>) => {
+    const ownerId = getCurrentOwnerUid();
+    const inv = invoices.find(i => i.id === txData.invoiceId);
     const newTx: PaymentTransaction = {
       ...txData,
+      workspaceId: currentWorkspace.id,
+      ownerId,
       id: `tx_${Date.now()}`,
       date: new Date().toISOString()
     };
     const next = [newTx, ...paymentTransactions];
     setPaymentTransactions(next);
     localStorage.setItem(STORAGE_KEYS.PAYMENTS, JSON.stringify(next));
+
+    if (canSyncToFirestore()) {
+      firestoreSetDoc(firestoreDoc(db, 'payments', newTx.id), {
+        id: newTx.id,
+        ownerId,
+        workspaceId: currentWorkspace.id,
+        invoiceId: txData.invoiceId,
+        projectId: inv?.projectId || '',
+        clientId: inv?.clientId || '',
+        amount: txData.amount,
+        date: newTx.date,
+        method: 'autre',
+        reference: txData.transactionRef,
+        status: txData.status,
+        createdAt: newTx.date
+      }).catch(err => handleCloudWriteError('Paiement', err));
+    }
   };
 
   const [auditLogs, setAuditLogs] = useState<AuditLogItem[]>(() => {
@@ -3065,16 +3635,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   // 8. Catalogue des Prestations & Packs (Source unique des tarifs du studio)
-  const [catalogServices, setCatalogServices] = useState<CatalogService[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.CATALOG_SERVICES);
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
-      } catch {}
-    }
-    return INITIAL_CATALOG_SERVICES;
-  });
+  const [catalogServices, setCatalogServices] = useState<CatalogService[]>([]);
 
   const saveCatalogServices = (next: CatalogService[]) => {
     setCatalogServices(next);
@@ -3083,16 +3644,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     } catch {}
   };
 
-  const [catalogPacks, setCatalogPacks] = useState<CatalogPack[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.CATALOG_PACKS);
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
-      } catch {}
-    }
-    return INITIAL_CATALOG_PACKS;
-  });
+  const [catalogPacks, setCatalogPacks] = useState<CatalogPack[]>([]);
 
   const saveCatalogPacks = (next: CatalogPack[]) => {
     setCatalogPacks(next);
@@ -3101,16 +3653,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     } catch {}
   };
 
-  const [projectTemplates, setProjectTemplates] = useState<ProjectTemplate[]>(() => {
-    const saved = localStorage.getItem(STORAGE_KEYS.PROJECT_TEMPLATES);
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
-      } catch {}
-    }
-    return INITIAL_TEMPLATES;
-  });
+  const [projectTemplates, setProjectTemplates] = useState<ProjectTemplate[]>([]);
 
   const saveProjectTemplates = (next: ProjectTemplate[]) => {
     setProjectTemplates(next);
@@ -3140,10 +3683,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Actions Prestations
   const addCatalogService = (data: Omit<CatalogService, 'id' | 'workspaceId' | 'createdAt' | 'updatedAt' | 'priceHistory' | 'usageCount'>): CatalogService => {
     const now = new Date().toISOString();
+    const ownerId = getCurrentOwnerUid();
     const newService: CatalogService = {
       ...data,
-      id: `srv_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       workspaceId: currentWorkspace.id,
+      ownerId,
+      id: `srv_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       unitPriceCents: Math.max(0, Math.round(data.unitPriceCents || 0)),
       taxRate: data.taxRate !== undefined ? data.taxRate : null,
       status: data.status || 'active',
@@ -3156,13 +3701,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const next = [newService, ...catalogServices];
     saveCatalogServices(next);
 
-    try {
-      firestoreSetDoc(firestoreDoc(db, 'catalog_services', newService.id), {
-        ...newService,
-        ownerId: auth.uid || currentWorkspace.ownerId,
-        workspaceId: currentWorkspace.id
-      }, { merge: true }).catch(() => {});
-    } catch {}
+    if (canSyncToFirestore()) {
+      try {
+        firestoreSetDoc(firestoreDoc(db, 'catalog_services', newService.id), {
+          ...newService,
+          ownerId,
+          workspaceId: currentWorkspace.id
+        }, { merge: true }).catch(err => handleCloudWriteError('Prestation catalogue', err));
+      } catch (err) {
+        handleCloudWriteError('Prestation catalogue', err);
+      }
+    }
 
     return newService;
   };
@@ -3195,12 +3744,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const next = catalogServices.map(s => s.id === id ? updatedService : s);
     saveCatalogServices(next);
 
-    try {
-      firestoreSetDoc(firestoreDoc(db, 'catalog_services', id), {
-        ...updatedService,
-        workspaceId: currentWorkspace.id
-      }, { merge: true }).catch(() => {});
-    } catch {}
+    if (canSyncToFirestore()) {
+      try {
+        firestoreSetDoc(firestoreDoc(db, 'catalog_services', id), {
+          ...updatedService,
+          workspaceId: currentWorkspace.id
+        }, { merge: true }).catch(err => handleCloudWriteError('Prestation catalogue', err));
+      } catch (err) {
+        handleCloudWriteError('Prestation catalogue', err);
+      }
+    }
   };
 
   const duplicateCatalogService = (id: string): CatalogService => {
@@ -3248,9 +3801,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const next = catalogServices.filter(s => s.id !== id);
     saveCatalogServices(next);
 
-    try {
-      firestoreDeleteDoc(firestoreDoc(db, 'catalog_services', id)).catch(() => {});
-    } catch {}
+    if (canSyncToFirestore()) {
+      try {
+        firestoreDeleteDoc(firestoreDoc(db, 'catalog_services', id))
+          .catch(err => handleCloudWriteError('Prestation catalogue', err));
+      } catch (err) {
+        handleCloudWriteError('Prestation catalogue', err);
+      }
+    }
 
     return { success: true };
   };
@@ -3258,6 +3816,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const importCommonPrestations = (items: Array<{ suggestionId: string; customPriceCents: number }>) => {
     const newServices: CatalogService[] = [];
     const now = new Date().toISOString();
+    const ownerId = getCurrentOwnerUid();
 
     for (const item of items) {
       const sug = COMMON_PRESTATION_SUGGESTIONS.find(s => s.id === item.suggestionId);
@@ -3266,6 +3825,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const newSrv: CatalogService = {
         id: `srv_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
         workspaceId: currentWorkspace.id,
+        ownerId,
         name: sug.name,
         category: sug.category,
         deliverableDescription: sug.deliverableDescription,
@@ -3286,25 +3846,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (newServices.length > 0) {
       const next = [...newServices, ...catalogServices];
       saveCatalogServices(next);
-      newServices.forEach(s => {
-        try {
-          firestoreSetDoc(firestoreDoc(db, 'catalog_services', s.id), {
-            ...s,
-            ownerId: auth.uid || currentWorkspace.ownerId,
-            workspaceId: currentWorkspace.id
-          }, { merge: true }).catch(() => {});
-        } catch {}
-      });
+      if (canSyncToFirestore()) {
+        newServices.forEach(s => {
+          try {
+            firestoreSetDoc(firestoreDoc(db, 'catalog_services', s.id), {
+              ...s,
+              ownerId,
+              workspaceId: currentWorkspace.id
+            }, { merge: true }).catch(err => handleCloudWriteError('Prestation catalogue', err));
+          } catch (err) {
+            handleCloudWriteError('Prestation catalogue', err);
+          }
+        });
+      }
     }
   };
 
   // Actions Packs
   const addCatalogPack = (data: Omit<CatalogPack, 'id' | 'workspaceId' | 'createdAt' | 'updatedAt' | 'priceHistory' | 'usageCount'>): CatalogPack => {
     const now = new Date().toISOString();
+    const ownerId = getCurrentOwnerUid();
     const newPack: CatalogPack = {
       ...data,
-      id: `pack_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       workspaceId: currentWorkspace.id,
+      ownerId,
+      id: `pack_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       packPriceCents: Math.max(0, Math.round(data.packPriceCents || 0)),
       taxRate: data.taxRate !== undefined ? data.taxRate : null,
       status: data.status || 'active',
@@ -3317,13 +3883,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const next = [newPack, ...catalogPacks];
     saveCatalogPacks(next);
 
-    try {
-      firestoreSetDoc(firestoreDoc(db, 'catalog_packs', newPack.id), {
-        ...newPack,
-        ownerId: auth.uid || currentWorkspace.ownerId,
-        workspaceId: currentWorkspace.id
-      }, { merge: true }).catch(() => {});
-    } catch {}
+    if (canSyncToFirestore()) {
+      try {
+        firestoreSetDoc(firestoreDoc(db, 'catalog_packs', newPack.id), {
+          ...newPack,
+          ownerId,
+          workspaceId: currentWorkspace.id
+        }, { merge: true }).catch(err => handleCloudWriteError('Pack catalogue', err));
+      } catch (err) {
+        handleCloudWriteError('Pack catalogue', err);
+      }
+    }
 
     return newPack;
   };
@@ -3355,12 +3925,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const next = catalogPacks.map(p => p.id === id ? updated : p);
     saveCatalogPacks(next);
 
-    try {
-      firestoreSetDoc(firestoreDoc(db, 'catalog_packs', id), {
-        ...updated,
-        workspaceId: currentWorkspace.id
-      }, { merge: true }).catch(() => {});
-    } catch {}
+    if (canSyncToFirestore()) {
+      try {
+        firestoreSetDoc(firestoreDoc(db, 'catalog_packs', id), {
+          ...updated,
+          workspaceId: currentWorkspace.id
+        }, { merge: true }).catch(err => handleCloudWriteError('Pack catalogue', err));
+      } catch (err) {
+        handleCloudWriteError('Pack catalogue', err);
+      }
+    }
   };
 
   const duplicateCatalogPack = (id: string): CatalogPack => {
@@ -3406,9 +3980,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const next = catalogPacks.filter(p => p.id !== id);
     saveCatalogPacks(next);
 
-    try {
-      firestoreDeleteDoc(firestoreDoc(db, 'catalog_packs', id)).catch(() => {});
-    } catch {}
+    if (canSyncToFirestore()) {
+      try {
+        firestoreDeleteDoc(firestoreDoc(db, 'catalog_packs', id))
+          .catch(err => handleCloudWriteError('Pack catalogue', err));
+      } catch (err) {
+        handleCloudWriteError('Pack catalogue', err);
+      }
+    }
 
     return { success: true };
   };
@@ -3416,10 +3995,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Actions Modèles de projet
   const addProjectTemplate = (data: Omit<ProjectTemplate, 'id' | 'workspaceId' | 'createdAt' | 'updatedAt'>): ProjectTemplate => {
     const now = new Date().toISOString();
+    const ownerId = getCurrentOwnerUid();
     const newTmpl: ProjectTemplate = {
       ...data,
       id: `tmpl_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       workspaceId: currentWorkspace.id,
+      ownerId,
       name: data.name || data.title || 'Modèle de projet',
       title: data.name || data.title || 'Modèle de projet',
       createdAt: now,
@@ -3429,13 +4010,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const next = [newTmpl, ...projectTemplates];
     saveProjectTemplates(next);
 
-    try {
-      firestoreSetDoc(firestoreDoc(db, 'project_templates', newTmpl.id), {
-        ...newTmpl,
-        ownerId: auth.uid || currentWorkspace.ownerId,
-        workspaceId: currentWorkspace.id
-      }, { merge: true }).catch(() => {});
-    } catch {}
+    if (canSyncToFirestore()) {
+      try {
+        firestoreSetDoc(firestoreDoc(db, 'project_templates', newTmpl.id), {
+          ...newTmpl,
+          ownerId,
+          workspaceId: currentWorkspace.id
+        }, { merge: true }).catch(err => handleCloudWriteError('Modèle de projet', err));
+      } catch (err) {
+        handleCloudWriteError('Modèle de projet', err);
+      }
+    }
 
     return newTmpl;
   };
@@ -3456,12 +4041,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const next = projectTemplates.map(t => t.id === id ? updated : t);
     saveProjectTemplates(next);
 
-    try {
-      firestoreSetDoc(firestoreDoc(db, 'project_templates', id), {
-        ...updated,
-        workspaceId: currentWorkspace.id
-      }, { merge: true }).catch(() => {});
-    } catch {}
+    if (canSyncToFirestore()) {
+      try {
+        firestoreSetDoc(firestoreDoc(db, 'project_templates', id), {
+          ...updated,
+          workspaceId: currentWorkspace.id
+        }, { merge: true }).catch(err => handleCloudWriteError('Modèle de projet', err));
+      } catch (err) {
+        handleCloudWriteError('Modèle de projet', err);
+      }
+    }
   };
 
   const duplicateProjectTemplate = (id: string): ProjectTemplate => {
@@ -3487,9 +4076,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const next = projectTemplates.filter(t => t.id !== id);
     saveProjectTemplates(next);
 
-    try {
-      firestoreDeleteDoc(firestoreDoc(db, 'project_templates', id)).catch(() => {});
-    } catch {}
+    if (canSyncToFirestore()) {
+      try {
+        firestoreDeleteDoc(firestoreDoc(db, 'project_templates', id))
+          .catch(err => handleCloudWriteError('Modèle de projet', err));
+      } catch (err) {
+        handleCloudWriteError('Modèle de projet', err);
+      }
+    }
   };
 
   const addCustomCategory = (cat: string) => {
@@ -3499,109 +4093,224 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     saveCustomCategories(next);
   };
 
-  // Synchronization with Cloud Firestore (Multi-tenant persistence)
+  // Synchronization with Cloud Firestore (Multi-tenant persistence - Authoritative Cloud Source)
   useEffect(() => {
-    if (!auth.isAuthenticated || !auth.workspaceId) return;
+    if (!isAuthReady || !isProfileLoaded || !auth.isAuthenticated || !firestoreUserDoc?.emailVerified) return;
+    const activeFbUser = firebaseAuth.currentUser || currentFbUser;
+    if (!activeFbUser || !activeFbUser.uid) {
+      return;
+    }
 
+    const isRealAccount = Boolean(
+      activeFbUser.uid !== 'designer_001' &&
+      activeFbUser.email &&
+      activeFbUser.email !== 'contact@monstudio.fr' &&
+      !activeFbUser.email.includes('demo')
+    );
+
+    if (!isRealAccount) {
+      return;
+    }
+
+    const currentUid = activeFbUser.uid;
+    const sessionSeq = authSessionSeqRef.current;
     let isMounted = true;
     async function syncFirestoreWorkspace() {
+      const stillValid = () => isMounted && authSessionSeqRef.current === sessionSeq;
       try {
-        const wsId = auth.workspaceId;
+        if (!stillValid()) return;
+
         // 1. Clients
-        const qClients = firestoreQuery(firestoreCol(db, 'clients'), firestoreWhere('workspaceId', '==', wsId));
+        const qClients = firestoreQuery(firestoreCol(db, 'clients'), firestoreWhere('ownerId', '==', currentUid));
         const snapClients = await firestoreGetDocs(qClients);
-        if (!snapClients.empty && isMounted) {
+        if (isMounted) {
           const cloudClients: Client[] = [];
           snapClients.forEach(docSnap => cloudClients.push(docSnap.data() as Client));
-          if (cloudClients.length > 0) {
+          if (isRealAccount) {
+            setClients(cloudClients);
+            saveClients(cloudClients);
+          } else if (cloudClients.length > 0) {
             setClients(prev => {
-              const prevOther = prev.filter(c => c.workspaceId !== wsId);
+              const prevOther = prev.filter(c => c.ownerId !== currentUid);
               return [...cloudClients, ...prevOther];
             });
           }
         }
 
         // 2. Projects
-        const qProjects = firestoreQuery(firestoreCol(db, 'projects'), firestoreWhere('workspaceId', '==', wsId));
+        const qProjects = firestoreQuery(firestoreCol(db, 'projects'), firestoreWhere('ownerId', '==', currentUid));
         const snapProjects = await firestoreGetDocs(qProjects);
-        if (!snapProjects.empty && isMounted) {
+        if (isMounted) {
           const cloudProjects: Project[] = [];
           snapProjects.forEach(docSnap => cloudProjects.push(normalizeProject(docSnap.data())));
-          if (cloudProjects.length > 0) {
+          if (isRealAccount) {
+            setProjects(cloudProjects);
+            saveProjects(cloudProjects);
+          } else if (cloudProjects.length > 0) {
             setProjects(prev => {
-              const prevOther = prev.filter(p => p.workspaceId !== wsId);
+              const prevOther = prev.filter(p => p.ownerId !== currentUid);
               return [...cloudProjects, ...prevOther];
             });
           }
         }
 
         // 3. Catalog Services
-        const qServices = firestoreQuery(firestoreCol(db, 'catalog_services'), firestoreWhere('workspaceId', '==', wsId));
+        const qServices = firestoreQuery(firestoreCol(db, 'catalog_services'), firestoreWhere('ownerId', '==', currentUid));
         const snapServices = await firestoreGetDocs(qServices);
-        if (!snapServices.empty && isMounted) {
+        if (isMounted) {
           const cloudServices: CatalogService[] = [];
           snapServices.forEach(docSnap => cloudServices.push(docSnap.data() as CatalogService));
-          if (cloudServices.length > 0) {
+          if (isRealAccount) {
+            setCatalogServices(cloudServices);
+            saveCatalogServices(cloudServices);
+          } else if (cloudServices.length > 0) {
             setCatalogServices(prev => {
-              const prevOther = prev.filter(s => s.workspaceId !== wsId);
+              const prevOther = prev.filter(s => s.ownerId !== currentUid);
               return [...cloudServices, ...prevOther];
             });
           }
         }
 
         // 4. Catalog Packs
-        const qPacks = firestoreQuery(firestoreCol(db, 'catalog_packs'), firestoreWhere('workspaceId', '==', wsId));
+        const qPacks = firestoreQuery(firestoreCol(db, 'catalog_packs'), firestoreWhere('ownerId', '==', currentUid));
         const snapPacks = await firestoreGetDocs(qPacks);
-        if (!snapPacks.empty && isMounted) {
+        if (isMounted) {
           const cloudPacks: CatalogPack[] = [];
           snapPacks.forEach(docSnap => cloudPacks.push(docSnap.data() as CatalogPack));
-          if (cloudPacks.length > 0) {
+          if (isRealAccount) {
+            setCatalogPacks(cloudPacks);
+            saveCatalogPacks(cloudPacks);
+          } else if (cloudPacks.length > 0) {
             setCatalogPacks(prev => {
-              const prevOther = prev.filter(p => p.workspaceId !== wsId);
+              const prevOther = prev.filter(p => p.ownerId !== currentUid);
               return [...cloudPacks, ...prevOther];
             });
           }
         }
 
         // 5. Project Templates
-        const qTemplates = firestoreQuery(firestoreCol(db, 'project_templates'), firestoreWhere('workspaceId', '==', wsId));
+        const qTemplates = firestoreQuery(firestoreCol(db, 'project_templates'), firestoreWhere('ownerId', '==', currentUid));
         const snapTemplates = await firestoreGetDocs(qTemplates);
-        if (!snapTemplates.empty && isMounted) {
+        if (isMounted) {
           const cloudTemplates: ProjectTemplate[] = [];
           snapTemplates.forEach(docSnap => cloudTemplates.push(docSnap.data() as ProjectTemplate));
-          if (cloudTemplates.length > 0) {
+          if (isRealAccount) {
+            setProjectTemplates(cloudTemplates);
+            saveProjectTemplates(cloudTemplates);
+          } else if (cloudTemplates.length > 0) {
             setProjectTemplates(prev => {
-              const prevOther = prev.filter(t => t.workspaceId !== wsId);
+              const prevOther = prev.filter(t => t.ownerId !== currentUid);
               return [...cloudTemplates, ...prevOther];
             });
           }
         }
 
         // 6. Quotes
-        const qQuotes = firestoreQuery(firestoreCol(db, 'quotes'), firestoreWhere('workspaceId', '==', wsId));
+        const qQuotes = firestoreQuery(firestoreCol(db, 'quotes'), firestoreWhere('ownerId', '==', currentUid));
         const snapQuotes = await firestoreGetDocs(qQuotes);
-        if (!snapQuotes.empty && isMounted) {
+        if (isMounted) {
           const cloudQuotes: Quote[] = [];
           snapQuotes.forEach(docSnap => cloudQuotes.push(docSnap.data() as Quote));
-          if (cloudQuotes.length > 0) {
+          if (isRealAccount) {
+            setQuotes(cloudQuotes);
+            saveQuotes(cloudQuotes);
+          } else if (cloudQuotes.length > 0) {
             setQuotes(prev => {
-              const prevOther = prev.filter(q => q.workspaceId !== wsId);
+              const prevOther = prev.filter(q => q.ownerId !== currentUid);
               return [...cloudQuotes, ...prevOther];
             });
           }
         }
 
         // 7. Invoices
-        const qInvoices = firestoreQuery(firestoreCol(db, 'invoices'), firestoreWhere('workspaceId', '==', wsId));
+        const qInvoices = firestoreQuery(firestoreCol(db, 'invoices'), firestoreWhere('ownerId', '==', currentUid));
         const snapInvoices = await firestoreGetDocs(qInvoices);
-        if (!snapInvoices.empty && isMounted) {
+        if (isMounted) {
           const cloudInvoices: Invoice[] = [];
           snapInvoices.forEach(docSnap => cloudInvoices.push(docSnap.data() as Invoice));
-          if (cloudInvoices.length > 0) {
+          if (isRealAccount) {
+            setInvoices(cloudInvoices);
+            saveInvoices(cloudInvoices);
+          } else if (cloudInvoices.length > 0) {
             setInvoices(prev => {
-              const prevOther = prev.filter(i => i.workspaceId !== wsId);
+              const prevOther = prev.filter(i => i.ownerId !== currentUid);
               return [...cloudInvoices, ...prevOther];
             });
+          }
+        }
+
+        // 8. Appointments
+        const qAppointments = firestoreQuery(firestoreCol(db, 'appointments'), firestoreWhere('ownerId', '==', currentUid));
+        const snapAppointments = await firestoreGetDocs(qAppointments);
+        if (isMounted) {
+          const cloudAppointments: ClientAppointment[] = [];
+          snapAppointments.forEach(docSnap => cloudAppointments.push(docSnap.data() as ClientAppointment));
+          if (isRealAccount) {
+            setAppointments(cloudAppointments);
+            saveAppointments(cloudAppointments);
+          } else if (cloudAppointments.length > 0) {
+            setAppointments(prev => {
+              const prevOther = prev.filter(a => a.ownerId !== currentUid);
+              return [...cloudAppointments, ...prevOther];
+            });
+          }
+        }
+
+        // 9. Time Entries
+        const qTime = firestoreQuery(firestoreCol(db, 'time_entries'), firestoreWhere('ownerId', '==', currentUid));
+        const snapTime = await firestoreGetDocs(qTime);
+        if (isMounted) {
+          const cloudTime: TimeEntry[] = [];
+          snapTime.forEach(docSnap => cloudTime.push(docSnap.data() as TimeEntry));
+          if (isRealAccount) {
+            setTimeEntries(cloudTime);
+            saveTimeEntries(cloudTime);
+          } else if (cloudTime.length > 0) {
+            setTimeEntries(prev => {
+              const prevOther = prev.filter(t => t.ownerId !== currentUid);
+              return [...cloudTime, ...prevOther];
+            });
+          }
+        }
+
+        // 10. Expenses
+        const qExpenses = firestoreQuery(firestoreCol(db, 'expenses'), firestoreWhere('ownerId', '==', currentUid));
+        const snapExpenses = await firestoreGetDocs(qExpenses);
+        if (isMounted) {
+          const cloudExpenses: ProjectExpense[] = [];
+          snapExpenses.forEach(docSnap => cloudExpenses.push(docSnap.data() as ProjectExpense));
+          if (isRealAccount) {
+            setExpenses(cloudExpenses);
+            saveExpenses(cloudExpenses);
+          } else if (cloudExpenses.length > 0) {
+            setExpenses(prev => {
+              const prevOther = prev.filter(e => e.ownerId !== currentUid);
+              return [...cloudExpenses, ...prevOther];
+            });
+          }
+        }
+
+        // 11. Payments
+        const qPayments = firestoreQuery(firestoreCol(db, 'payments'), firestoreWhere('ownerId', '==', currentUid));
+        const snapPayments = await firestoreGetDocs(qPayments);
+        if (isMounted) {
+          const cloudPayments: PaymentTransaction[] = [];
+          snapPayments.forEach(docSnap => {
+            const d = docSnap.data();
+            cloudPayments.push({
+              id: d.id || docSnap.id,
+              invoiceId: d.invoiceId || '',
+              amount: d.amount || 0,
+              transactionRef: d.reference || d.transactionRef || '',
+              status: d.status || 'succeeded',
+              date: d.date || d.createdAt || new Date().toISOString(),
+              workspaceId: d.workspaceId,
+              ownerId: d.ownerId
+            });
+          });
+          if (isRealAccount) {
+            setPaymentTransactions(cloudPayments);
+            localStorage.setItem(STORAGE_KEYS.PAYMENTS, JSON.stringify(cloudPayments));
           }
         }
 
@@ -3625,12 +4334,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         });
       } catch (err) {
         console.warn('[Firestore] Sync notice:', err);
+        if (stillValid() && firebaseAuth.currentUser?.uid === currentUid) {
+          handleCloudWriteError('Synchronisation Cloud', err);
+        }
       }
     }
 
     syncFirestoreWorkspace();
     return () => { isMounted = false; };
-  }, [auth.isAuthenticated, auth.workspaceId]);
+  }, [currentFbUser?.uid, auth.isAuthenticated, isAuthReady, isProfileLoaded, firestoreUserDoc?.emailVerified]);
 
 
   // Multi-tenant Workspace Scoped Business Collections
@@ -3781,8 +4493,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
   }, [currentWorkspace, workspaceProjects, workspaceClients, workspaceQuotes, plans]);
 
-  // Export full workspace data (portability & GDPR)
-  const exportFullWorkspaceData = () => {
+  // Export full workspace data (portability & GDPR) — exécuté après ré-authentification
+  const performExportFullWorkspaceData = () => {
     const data = {
       workspace: currentWorkspace,
       profile,
@@ -3800,6 +4512,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     a.click();
     URL.revokeObjectURL(url);
   };
+
+  const exportFullWorkspaceData = performExportFullWorkspaceData;
 
   return (
     <AppContext.Provider
@@ -3828,6 +4542,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         addPromoCode,
         togglePromoCode,
         exportFullWorkspaceData,
+        performExportFullWorkspaceData,
 
         // Auth additions
         registerWithEmail,
@@ -3836,8 +4551,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         verifyEmailCode,
         acceptCurrentTerms,
         linkGoogleAccount,
+        linkGoogleFromSettings,
         reauthenticate,
+        reauthenticateWithGoogle,
+        changeAccountPassword,
+        changeAccountEmail,
+        deleteOwnAccount,
+        revokeAllDevices,
+        isAuthReady,
+        isProfileLoaded,
         isAuthLoading,
+        firestoreUserDoc,
         authError,
         clearAuthError,
 

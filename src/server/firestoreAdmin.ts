@@ -72,6 +72,106 @@ export async function persistEmailLogInFirestore(log: any): Promise<void> {
   }
 }
 
+/**
+ * Quota mensuel par plan stocké en base Firestore Admin
+ */
+export async function checkAndIncrementDbEmailQuota(workspaceId: string, plan: string): Promise<{
+  allowed: boolean;
+  currentCount: number;
+  maxAllowed: number;
+}> {
+  const yearMonth = new Date().toISOString().slice(0, 7);
+  const cleanPlan = (plan || 'free').toLowerCase();
+  const maxAllowed = cleanPlan === 'agency' ? 5000 : cleanPlan === 'pro' ? 1000 : 30;
+  const quotaRef = adminDb.collection('email_quotas').doc(`${workspaceId}_${yearMonth}`);
+
+  try {
+    const snap = await quotaRef.get();
+    const currentCount = snap.exists ? (Number(snap.data()?.count) || 0) : 0;
+    if (currentCount >= maxAllowed) {
+      return { allowed: false, currentCount, maxAllowed };
+    }
+    await quotaRef.set({
+      workspaceId,
+      yearMonth,
+      plan: cleanPlan,
+      count: currentCount + 1,
+      maxAllowed,
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
+    return { allowed: true, currentCount: currentCount + 1, maxAllowed };
+  } catch (err: any) {
+    console.warn('[FirestoreAdmin] checkAndIncrementDbEmailQuota warning:', err.message);
+    return { allowed: true, currentCount: 1, maxAllowed };
+  }
+}
+
+/**
+ * Récupère les journaux d'emails d'un workspace depuis Firestore Admin
+ */
+export async function getWorkspaceEmailLogsFromDb(workspaceId: string): Promise<any[]> {
+  if (!workspaceId) return [];
+  try {
+    const snapshot = await adminDb.collection('email_logs')
+      .where('workspaceId', '==', workspaceId)
+      .limit(100)
+      .get();
+    const logs: any[] = [];
+    snapshot.forEach(doc => {
+      logs.push({ id: doc.id, ...doc.data() });
+    });
+    logs.sort((a, b) => new Date(b.sentAt || b.createdAt || 0).getTime() - new Date(a.sentAt || a.createdAt || 0).getTime());
+    return logs;
+  } catch (err: any) {
+    console.warn('[FirestoreAdmin] getWorkspaceEmailLogsFromDb warning:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Vérifie en base Firestore Admin que le destinataire est bien un client du workspace ou de l'utilisateur
+ */
+export async function isRecipientClientOfWorkspace(
+  email: string,
+  userId: string,
+  workspaceId?: string
+): Promise<boolean> {
+  const cleanEmail = (email || '').trim().toLowerCase();
+  if (!cleanEmail) return false;
+
+  try {
+    const snapByOwner = await adminDb.collection('clients')
+      .where('ownerId', '==', userId)
+      .get();
+
+    for (const doc of snapByOwner.docs) {
+      const cEmail = (doc.data()?.email || '').trim().toLowerCase();
+      if (cEmail === cleanEmail) {
+        return true;
+      }
+    }
+
+    if (workspaceId) {
+      const snapByWs = await adminDb.collection('clients')
+        .where('workspaceId', '==', workspaceId)
+        .get();
+
+      for (const doc of snapByWs.docs) {
+        const cEmail = (doc.data()?.email || '').trim().toLowerCase();
+        if (cEmail === cleanEmail) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  } catch (err: any) {
+    console.warn('[FirestoreAdmin] isRecipientClientOfWorkspace error:', err.message);
+    return false;
+  }
+}
+
+
 export async function runStorageHealthDiagnostic(): Promise<any> {
   const timestamp = new Date().toISOString();
   let writeSuccess = false;

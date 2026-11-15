@@ -33,6 +33,7 @@ import { useApp } from '../../context/AppContext';
 import { Workspace, PlanId, PlanConfig, PromoCode, PlatformEmailTemplate } from '../../types';
 import { CustomSelect } from '../common/CustomSelect';
 import { DEFAULT_PLANS, INITIAL_PROMO_CODES, DEFAULT_PLATFORM_EMAIL_TEMPLATES } from '../../data/plansAndWorkspaces';
+import { auth as firebaseAuth } from '../../config/firebase';
 
 export interface SuperAdminViewProps {
   onExit?: () => void;
@@ -69,12 +70,19 @@ export const SuperAdminView: React.FC<SuperAdminViewProps> = ({ onExit }) => {
   const [isLoadingStorageHealth, setIsLoadingStorageHealth] = useState(false);
   const [storageTestRunning, setStorageTestRunning] = useState(false);
 
+  const getAdminAuthHeaders = async () => {
+    const token = await firebaseAuth.currentUser?.getIdToken();
+    return {
+      'Content-Type': 'application/json',
+      ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+    };
+  };
+
   const fetchStorageHealth = async () => {
     setIsLoadingStorageHealth(true);
     try {
-      const res = await fetch('/api/admin/storage/health', {
-        headers: { 'x-admin-email': auth.email }
-      });
+      const headers = await getAdminAuthHeaders();
+      const res = await fetch('/api/admin/storage/health', { headers });
       const data = await res.json();
       setStorageHealth(data);
     } catch (err: any) {
@@ -87,9 +95,8 @@ export const SuperAdminView: React.FC<SuperAdminViewProps> = ({ onExit }) => {
   const handleRunLiveStorageTest = async () => {
     setStorageTestRunning(true);
     try {
-      const res = await fetch('/api/admin/storage/health', {
-        headers: { 'x-admin-email': auth.email }
-      });
+      const headers = await getAdminAuthHeaders();
+      const res = await fetch('/api/admin/storage/health', { headers });
       const data = await res.json();
       setStorageHealth(data);
       if (data.connected) {
@@ -125,13 +132,10 @@ export const SuperAdminView: React.FC<SuperAdminViewProps> = ({ onExit }) => {
   const fetchPlatformEmailData = async () => {
     setIsLoadingPlatformEmail(true);
     try {
+      const headers = await getAdminAuthHeaders();
       const [statusRes, logsRes] = await Promise.all([
-        fetch('/api/admin/email/status', {
-          headers: { 'x-admin-email': auth.email }
-        }),
-        fetch('/api/admin/email/logs', {
-          headers: { 'x-admin-email': auth.email }
-        })
+        fetch('/api/admin/email/status', { headers }),
+        fetch('/api/admin/email/logs', { headers })
       ]);
       const statusData = await statusRes.json();
       const logsData = await logsRes.json();
@@ -168,12 +172,10 @@ export const SuperAdminView: React.FC<SuperAdminViewProps> = ({ onExit }) => {
     const targetEmail = platformTestRecipient.trim() || auth.email;
 
     try {
+      const headers = await getAdminAuthHeaders();
       const res = await fetch('/api/admin/email/test', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-admin-email': auth.email
-        },
+        headers,
         body: JSON.stringify({ to: targetEmail })
       });
       const data = await res.json();

@@ -362,7 +362,7 @@ export const ProjectFilesTab: React.FC<ProjectFilesTabProps> = ({ project }) => 
                     { value: 'PDF', label: 'PDF (Impression / Certifié)' },
                     { value: 'AI', label: 'AI (Illustrator Vectoriel)' },
                     { value: 'PSD', label: 'PSD (Photoshop)' },
-                    { value: 'SVG', label: 'SVG (Web Vectoriel)' },
+                    { value: 'EPS', label: 'EPS (Vectoriel certifié)' },
                     { value: 'PNG', label: 'PNG (Haute rés. transparent)' },
                     { value: 'ZIP', label: 'ZIP (Pack complet)' }
                   ]}

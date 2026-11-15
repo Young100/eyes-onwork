@@ -86,6 +86,7 @@ export interface PriceHistoryEntry {
 export interface CatalogService {
   id: string;
   workspaceId: string;
+  ownerId?: string;
   name: string;
   category: string;
   deliverableDescription: string;
@@ -104,6 +105,7 @@ export interface CatalogService {
 export interface CatalogPack {
   id: string;
   workspaceId: string;
+  ownerId?: string;
   name: string;
   description?: string;
   deliverableDescription?: string;
@@ -159,6 +161,7 @@ export interface CreativeBrief {
 export interface ProjectTemplate {
   id: string;
   workspaceId: string;
+  ownerId?: string;
   title: string;
   name?: string;
   category?: ProjectType;
@@ -184,6 +187,7 @@ export interface ProjectTemplate {
 export interface Client {
   id: string;
   workspaceId: string;
+  ownerId?: string;
   name: string;
   company?: string;
   email: string;
@@ -292,6 +296,7 @@ export interface DeliveryConfig {
 export interface Project {
   id: string;
   workspaceId: string;
+  ownerId?: string;
   clientId: string; // Obligatoire
   clientShareToken: string;
   clientLinkActive: boolean;
@@ -346,6 +351,7 @@ export type QuoteStatus = 'draft' | 'sent' | 'accepted' | 'refused' | 'expired';
 export interface Quote {
   id: string;
   workspaceId?: string;
+  ownerId?: string;
   isDemo?: boolean;
   quoteNumber: string; // DEV-AAAA-NNN
   version?: number; // 1, 2, ...
@@ -387,6 +393,7 @@ export type PaymentMethod = 'virement' | 'especes' | 'mobile_money' | 'cheque' |
 export interface PaymentRecord {
   id: string;
   invoiceId: string;
+  ownerId?: string;
   amount: number;
   date: string;
   method: PaymentMethod;
@@ -400,6 +407,7 @@ export type InvoiceStatus = 'draft' | 'sent' | 'partially_paid' | 'paid' | 'over
 export interface Invoice {
   id: string;
   workspaceId?: string;
+  ownerId?: string;
   isDemo?: boolean;
   invoiceNumber: string; // FAC-AAAA-NNN
   type: InvoiceType;
@@ -615,6 +623,7 @@ export interface ClientAppointment {
   time: string;
   status: 'scheduled' | 'completed' | 'cancelled';
   workspaceId?: string;
+  ownerId?: string;
   isDemo?: boolean;
   durationMinutes?: number;
   reminderMinutes?: number;
@@ -631,6 +640,7 @@ export interface TimeEntry {
   hourlyRate?: number;
   date: string;
   workspaceId?: string;
+  ownerId?: string;
   isDemo?: boolean;
 }
 
@@ -642,6 +652,7 @@ export interface ProjectExpense {
   category: string;
   date: string;
   workspaceId?: string;
+  ownerId?: string;
   isDemo?: boolean;
 }
 
@@ -695,6 +706,7 @@ export interface PaymentTransaction {
   status: 'succeeded' | 'failed';
   date: string;
   workspaceId?: string;
+  ownerId?: string;
   isDemo?: boolean;
 }
 
