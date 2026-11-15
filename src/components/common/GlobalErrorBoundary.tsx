@@ -1,5 +1,6 @@
 import React, { Component, ErrorInfo, ReactNode } from 'react';
 import { AlertTriangle, RefreshCw, LogOut, ShieldAlert } from 'lucide-react';
+import { auth as firebaseAuth } from '../../config/firebase';
 
 interface Props {
   children: ReactNode;
@@ -35,29 +36,27 @@ export class GlobalErrorBoundary extends Component<Props, State> {
     this.setState({ errorInfo });
 
     // Journalise l'erreur côté serveur si l'utilisateur est authentifié
-    try {
-      import('../../config/firebase').then(async ({ auth }) => {
-        try {
-          const idToken = auth?.currentUser ? await auth.currentUser.getIdToken() : null;
-          if (!idToken) return;
+    void (async () => {
+      try {
+        const idToken = firebaseAuth?.currentUser ? await firebaseAuth.currentUser.getIdToken() : null;
+        if (!idToken) return;
 
-          fetch('/api/system/log-error', {
-            method: 'POST',
-            headers: { 
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${idToken}`
-            },
-            body: JSON.stringify({
-              source: 'GlobalErrorBoundary',
-              message: (error.message || 'React render crash').slice(0, 500),
-              stack: (error.stack || '').slice(0, 2000),
-              path: typeof window !== 'undefined' ? window.location.pathname.slice(0, 200) : '',
-              timestamp: new Date().toISOString()
-            })
-          }).catch(() => {});
-        } catch {}
-      }).catch(() => {});
-    } catch {}
+        await fetch('/api/system/log-error', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${idToken}`
+          },
+          body: JSON.stringify({
+            source: 'GlobalErrorBoundary',
+            message: (error.message || 'React render crash').slice(0, 500),
+            stack: (error.stack || '').slice(0, 2000),
+            path: typeof window !== 'undefined' ? window.location.pathname.slice(0, 200) : '',
+            timestamp: new Date().toISOString()
+          })
+        }).catch(() => {});
+      } catch {}
+    })();
   }
 
   handleReload = () => {
